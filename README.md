@@ -32,8 +32,8 @@ Flags:
 ```bash
 gh migrate-lfs export \
   --source-organization mona-actions \
-  --token ghp_xxxxxxxxxxxx \
-  --depth 2
+  --source-token ghp_xxxxxxxxxxxx \
+  --search-depth 2
 ```
 
 This will create a file named `{organization}_lfs.csv` containing all repositories with LFS files. The export process provides additional feedback:
@@ -71,8 +71,8 @@ Flags:
 ```bash
 gh migrate-lfs pull \
   --file mona-actions_lfs.csv \
-  --work-dir ./repos \
-  --token ghp_xxxxxxxxxxxx \
+  --work-dir ./lfs_repos \
+  --source-token ghp_xxxxxxxxxxxx \
   --workers 4
 ```
 
@@ -82,7 +82,7 @@ The pull process provides feedback:
 📊 Summary:
 ✅ Successfully processed: 2 repositories
 ❌ Failed: 0 repositories
-📁 Output directory: repos/
+📁 Output directory: lfs_repos/
 🕐 Total time: 3s
 
 ✅ Pull completed successfully!
@@ -112,7 +112,7 @@ Flags:
 gh migrate-lfs sync \
   --file mona-actions_lfs.csv \
   --target-organization mona-emu \
-  --token ghp_xxxxxxxxxxxx \
+  --target-token ghp_xxxxxxxxxxxx \
   --work-dir lfs_repos/
 ```
 
@@ -122,7 +122,7 @@ The sync process provides feedback:
 📊 Summary:
 ✅ Successfully processed: 2 repositories
 ❌ Failed: 0 repositories
-📁 Output directory: repos/
+📁 Output directory: lfs_repos/
 🕐 Total time: 5s
 
 ✅ Sync completed successfully!
@@ -167,8 +167,8 @@ Global Flags:
 # Example usage with proxy:
 gh migrate-lfs pull \
   --file mona-actions_lfs.csv \
-  --work-dir ./repos \
-  --token ghp_xxxxxxxxxxxx \
+  --work-dir ./lfs_repos \
+  --source-token ghp_xxxxxxxxxxxx \
   --https-proxy https://proxy.example.com:8080
 ```
 
@@ -194,7 +194,7 @@ The tool supports loading configuration from a `.env` file. This provides an alt
 
 ```bash
 # GitHub Migration LFS (GHMLFS)
-GHMLFS_SOURCE_ORGANIZATION==mona-actions # Source organization name
+GHMLFS_SOURCE_ORGANIZATION=mona-actions  # Source organization name
 GHMLFS_SOURCE_HOSTNAME=                  # Source hostname
 GHMLFS_SOURCE_TOKEN=ghp_xxx              # Source token
 GHMLFS_TARGET_ORGANIZATION=mona-emu      # Target organization name
