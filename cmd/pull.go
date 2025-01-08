@@ -21,7 +21,7 @@ var pullCmd = &cobra.Command{
 			"GHMLFS_WORKERS":         false,
 		})
 
-		ShowConnectionStatus("export")
+		ShowConnectionStatus("pull")
 		if err := pull.PullLFSFromCSV(); err != nil {
 			fmt.Printf("failed to export variables: %v\n", err)
 		}

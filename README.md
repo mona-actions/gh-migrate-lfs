@@ -200,7 +200,7 @@ GHMLFS_SOURCE_TOKEN=ghp_xxx              # Source token
 GHMLFS_TARGET_ORGANIZATION=mona-emu      # Target organization name
 GHMLFS_TARGET_HOSTNAME=                  # Target hostname
 GHMLFS_TARGET_TOKEN=ghp_yyy              # Target token
-GHMLFS_WORKERS=                          # worker count
+GHMLFS_WORKERS=1                         # worker count
 GHMLFS_WORKDIR=                          # work directory
 GHMLFS_FILE=${GHMLFS_SOURCE_ORGANIZATION}_lfs.csv # Input CSV file name
 ```

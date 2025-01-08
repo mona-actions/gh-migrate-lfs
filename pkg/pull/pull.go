@@ -25,6 +25,11 @@ func PullLFSFromCSV() error {
 	workDir := viper.GetString("GHMLFS_WORK_DIR")
 	maxWorkers := viper.GetInt("GHMLFS_WORKERS")
 
+	// Ensure at least 1 worker
+	if maxWorkers <= 0 {
+		maxWorkers = 1
+	}
+
 	// Read CSV file
 	file, err := os.Open(inputFile)
 	if err != nil {
