@@ -252,6 +252,7 @@ This configuration allows you to:
 
 ## Limitations
 
+- Requires `git-lfs` to be installed
 - Target repositories must exist in the destination organization before syncing
 - Large LFS files may take significant time to download and upload
 - Network bandwidth and storage space should be considered when migrating large LFS repositories
