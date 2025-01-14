@@ -11,6 +11,12 @@
 gh extension install mona-actions/gh-migrate-lfs
 ```
 
+## Upgrade
+
+```sh
+gh extension upgrade gh-migrate-lfs
+```
+
 ## Usage: Export
 
 Export a list of repositories containing Git LFS files to a CSV file.
@@ -163,17 +169,18 @@ Global Flags:
       --no-proxy string      No proxy list (can also use NO_PROXY env var)
 ```
 
+Example usage with proxy:
+
 ```bash
-# Example usage with proxy:
 gh migrate-lfs pull \
   --file mona-actions_lfs.csv \
   --work-dir ./lfs_repos \
   --source-token ghp_xxxxxxxxxxxx \
   --https-proxy https://proxy.example.com:8080
 ```
+Example with environment variables:
 
 ```bash
-# Example with environment variables:
 export HTTPS_PROXY=https://proxy.example.com:8080
 export NO_PROXY=github.internal.com
 export GHMLFS_TARGET_TOKEN=ghp_...
@@ -193,7 +200,6 @@ The tool supports loading configuration from a `.env` file. This provides an alt
 1. Create a `.env` file in your working directory:
 
 ```bash
-# GitHub Migration LFS (GHMLFS)
 GHMLFS_SOURCE_ORGANIZATION=mona-actions  # Source organization name
 GHMLFS_SOURCE_HOSTNAME=                  # Source hostname
 GHMLFS_SOURCE_TOKEN=ghp_xxx              # Source token
@@ -254,7 +260,7 @@ This configuration allows you to:
 
 - Requires `git-lfs` to be installed
 - Target repositories must exist in the destination organization before syncing
-- Large LFS files may take significant time to download and upload
+- Large LFS repositories will take significant time to download and upload
 - Network bandwidth and storage space should be considered when migrating large LFS repositories
 - The tool will retry failed operations but may still encounter persistent access or network issues
 - Deep directory structures may require adjusting the search depth parameter
