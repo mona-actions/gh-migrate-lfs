@@ -17,6 +17,8 @@ gh extension install mona-actions/gh-migrate-lfs
 gh extension upgrade gh-migrate-lfs
 ```
 
+## LFS Migration Types
+
 This tool offers offers a **branch** and **mirror** based approach to migrate LFS content.
 
 - **Mirror-Based Approach**
@@ -28,15 +30,9 @@ This tool offers offers a **branch** and **mirror** based approach to migrate LF
   - Pushes the default branch first 
 Provides resilience against disruptions during the migration process.
 
-The migration process is split into 3 steps:
+Export is the first step and is used to export a list of repositories containing Git LFS files to a CSV file and we do this by looking for `.gitattributes` files in the repositories. Pull is the second step and is used to clone the repositories and download their LFS objects. Sync is the third step and is used to push the LFS objects to the target repository.
 
-1. **Export**
-2. **Pull**
-3. **Sync**
-
-Export is the first step and is used to export a list of repositories containing Git LFS files to a CSV file and we do this by looking for `.gitattributes` files in the repositories. Pull is the second step and is used to clone the repositories and download their LFS objects. Sync is the third step and is used to push the LFS objects to the target organization.
-
-Doing the pull ahead of the migration is recommended as it will speed up the sync process. The pull step is also capable of fetching updates to the LFS objects if the repositories have been updated since the last pull.
+Doing the pull ahead of the migration is recommended, especially for larger or active repositories. The pull step is also capable of fetching updates to the repositories if they have been updated since the last pull.
 
 ## Usage: Export
 
@@ -287,7 +283,9 @@ This configuration allows you to:
 - Large LFS repositories will take significant time to download and upload
 - Network bandwidth and storage space should be considered when migrating large LFS repositories
 - The tool will retry failed operations but may still encounter persistent access or network issues
-- Deep directory structures may require adjusting the search depth parameter
+- Deep directory structures may require adjusting the search depth parameter 
+- Workers operate on a per repository basis and are not recommended for large repositories
+- Too many workers can result in ratelimiting. 
 
 ## License
 
