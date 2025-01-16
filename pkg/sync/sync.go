@@ -100,21 +100,12 @@ func SyncLFSContent(repoName, workDir, targetOrg, token string) error {
 
 	// Set environment variables
 	env := append(os.Environ(),
-		"GIT_LFS_SKIP_SMUDGE=1",
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_TRACE=1",
 		"GIT_CURL_VERBOSE=1",
 	)
 
 	fmt.Printf("Syncing %s to %s/%s...\n", repoName, targetOrg, repoName)
-
-	// Initialize Git LFS
-	lfsInstallCmd := exec.Command("git", "lfs", "install")
-	lfsInstallCmd.Dir = repoPath
-	lfsInstallCmd.Env = env
-	if err := lfsInstallCmd.Run(); err != nil {
-		return fmt.Errorf("failed to install git lfs: %w", err)
-	}
 
 	// Set the remote URL without embedding the token
 	baseURL := fmt.Sprintf("https://github.com/%s/%s.git", targetOrg, repoName)
@@ -134,21 +125,10 @@ func SyncLFSContent(repoName, workDir, targetOrg, token string) error {
 		return fmt.Errorf("failed to get remote url: %w", err)
 	}
 	remoteURL := strings.TrimSpace(string(output))
-	fmt.Printf("Verified remote URL: %s\n", remoteURL)
-
-	// Push all branches
-	fmt.Printf("Pushing content for %s...\n", repoName)
-	pushCmd := exec.Command("git", "push", "--all", "origin")
-	pushCmd.Dir = repoPath
-	pushCmd.Env = env
-	if output, err := pushCmd.CombinedOutput(); err != nil {
-		// Mask token in error message
-		errMsg := strings.ReplaceAll(string(output), token, "****")
-		return fmt.Errorf("failed to push content: %s, %w", errMsg, err)
-	}
+	fmt.Printf("remote URL: %s\n", remoteURL)
 
 	// Push LFS content
-	lfsPushCmd := exec.Command("git", "lfs", "push", "--all", "origin")
+	lfsPushCmd := exec.Command("git", "lfs", "push", "--all")
 	lfsPushCmd.Dir = repoPath
 	lfsPushCmd.Env = env
 	if output, err := lfsPushCmd.CombinedOutput(); err != nil {

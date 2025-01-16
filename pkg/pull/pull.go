@@ -103,7 +103,7 @@ func PullLFSFromCSV() error {
 
 // PullLFSContent remains unchanged from your original version
 func PullLFSContent(repoName, cloneURL, token, workDir string) error {
-	repoPath := filepath.Join(workDir, repoName)
+	repoPath := filepath.Join(workDir, repoName+".git")
 
 	// Create working directory if it doesn't exist
 	if err := os.MkdirAll(workDir, 0755); err != nil {
@@ -114,13 +114,13 @@ func PullLFSContent(repoName, cloneURL, token, workDir string) error {
 	if _, err := os.Stat(repoPath); err == nil {
 		pterm.Info.Printf("Repository exists '%s', proceeding with update\n", repoName)
 
-		pullCmd := exec.Command("git", "pull", "--all")
+		pullCmd := exec.Command("git", "fetch", "--prune", "origin", "+refs/*:refs/*")
 		pullCmd.Dir = repoPath
 		if output, err := pullCmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("❌ Failed to pull updates: %s, %w", string(output), err)
 		}
 
-		lfsPullCmd := exec.Command("git", "lfs", "pull")
+		lfsPullCmd := exec.Command("git", "lfs", "fetch", "--all")
 		lfsPullCmd.Dir = repoPath
 		if output, err := lfsPullCmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("❌ Failed to pull LFS content: %s, %w", string(output), err)
@@ -130,11 +130,9 @@ func PullLFSContent(repoName, cloneURL, token, workDir string) error {
 		return nil
 	}
 
-	// Clone the repository with GIT_LFS_SKIP_SMUDGE to avoid large file download during clone
 	pterm.Info.Printf("Cloning repository '%s'...\n", repoName)
-	cloneCmd := exec.Command("git", "clone", cloneURL)
+	cloneCmd := exec.Command("git", "clone", "--mirror", cloneURL)
 	cloneCmd.Dir = workDir
-	cloneCmd.Env = append(os.Environ(), "GIT_LFS_SKIP_SMUDGE=1")
 	if output, err := cloneCmd.CombinedOutput(); err != nil {
 		errMsg := strings.ReplaceAll(string(output), token, "****")
 		return fmt.Errorf("❌ Failed to clone repository: %s, %w", errMsg, err)
@@ -143,10 +141,10 @@ func PullLFSContent(repoName, cloneURL, token, workDir string) error {
 	pterm.Info.Printf("Pulling LFS objects for repository '%s'...\n", repoName)
 
 	// Pull LFS content using the environment token
-	lfsPullCmd := exec.Command("git", "lfs", "pull")
+	lfsPullCmd := exec.Command("git", "lfs", "fetch", "--all")
 	lfsPullCmd.Dir = repoPath
 	if output, err := lfsPullCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("❌ Failed to pull LFS content: %s, %w", string(output), err)
+		return fmt.Errorf("❌ Failed to fetch LFS content: %s, %w", string(output), err)
 	}
 
 	pterm.Success.Printf("synchronized: %s\n", repoName)

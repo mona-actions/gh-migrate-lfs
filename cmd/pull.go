@@ -23,7 +23,7 @@ var pullCmd = &cobra.Command{
 
 		ShowConnectionStatus("pull")
 		if err := pull.PullLFSFromCSV(); err != nil {
-			fmt.Printf("failed to export variables: %v\n", err)
+			fmt.Printf("failed to export lfs repositories: %v\n", err)
 		}
 	},
 }
