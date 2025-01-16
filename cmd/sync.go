@@ -14,6 +14,7 @@ var syncCmd = &cobra.Command{
 	Long:  "Sync LFS objects to migrated repositories",
 	Run: func(cmd *cobra.Command, args []string) {
 		GetFlagOrEnv(cmd, map[string]bool{
+			"GHMLFS_BRANCH_MODE":         false,
 			"GHMLFS_FILE":                true,
 			"GHMLFS_TARGET_HOSTNAME":     false,
 			"GHMLFS_TARGET_ORGANIZATION": true,
@@ -37,6 +38,7 @@ func init() {
 	syncCmd.Flags().StringP("work-dir", "d", "", "Working directory with cloned repositories (required)")
 	syncCmd.Flags().IntP("workers", "w", 1, "Number of concurrent GIT workers to use")
 
+	viper.BindPFlag("GHMLFS_BRANCH_MODE", syncCmd.Flags().Lookup("branch-mode"))
 	viper.BindPFlag("GHMLFS_FILE", syncCmd.Flags().Lookup("file"))
 	viper.BindPFlag("GHMLFS_TARGET_HOSTNAME", syncCmd.Flags().Lookup("target-hostname"))
 	viper.BindPFlag("GHMLFS_TARGET_ORGANIZATION", syncCmd.Flags().Lookup("target-organization"))

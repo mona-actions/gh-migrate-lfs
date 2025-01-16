@@ -17,6 +17,27 @@ gh extension install mona-actions/gh-migrate-lfs
 gh extension upgrade gh-migrate-lfs
 ```
 
+This tool offers offers a **branch** and **mirror** based approach to migrate LFS content.
+
+- **Mirror-Based Approach**
+  - Ideal for smaller repositories.
+  - Offers quick pull and push capabilities, potentially reducing time.
+- **Branch-Based Approach**
+  - Tailored for larger repositories where reliability is crucial.
+  - Can handle network interruptions, allowing the migration to continue from the last successful point rather than starting over from scratch.
+  - Pushes the default branch first 
+Provides resilience against disruptions during the migration process.
+
+The migration process is split into 3 steps:
+
+1. **Export**
+2. **Pull**
+3. **Sync**
+
+Export is the first step and is used to export a list of repositories containing Git LFS files to a CSV file and we do this by looking for `.gitattributes` files in the repositories. Pull is the second step and is used to clone the repositories and download their LFS objects. Sync is the third step and is used to push the LFS objects to the target organization.
+
+Doing the pull ahead of the migration is recommended as it will speed up the sync process. The pull step is also capable of fetching updates to the LFS objects if the repositories have been updated since the last pull.
+
 ## Usage: Export
 
 Export a list of repositories containing Git LFS files to a CSV file.
@@ -64,6 +85,7 @@ Usage:
   migrate-lfs pull [flags]
 
 Flags:
+  -b, --branch-mode bool         Branch based approach (default false)
   -f, --file string              Exported LFS repos file path, csv format (required)
   -h, --help                     help for pull
   -n, --source-hostname string   GitHub Enterprise Server hostname URL (optional)
@@ -103,6 +125,7 @@ Usage:
   migrate-lfs sync [flags]
 
 Flags:
+  -b, --branch-mode bool             Branch based approach (default false)
   -f, --file string                  Exported LFS repos file path, csv format (required)
   -h, --help                         help for sync
   -n, --target-hostname string       GitHub Enterprise Server hostname URL (optional)
@@ -148,7 +171,7 @@ another-repo,.gitattributes,https://github.com/mona-actions/another-repo.git
 - `GitAttributesPath`: Path to .gitattributes file containing LFS configurations
 - `CloneUrl`: The repository HTTPS URL
 
-## Required Permissions
+## Required Token Permissions
 
 ### For Export, Pull and Sync
 
@@ -191,7 +214,7 @@ gh migrate-lfs export \
     --source-organization mona-actions
 ```
 
-## Environment Variables
+## Using a `.env` file (recommended)
 
 The tool supports loading configuration from a `.env` file. This provides an alternative to command-line flags and allows you to store your configuration securely.
 
@@ -200,6 +223,7 @@ The tool supports loading configuration from a `.env` file. This provides an alt
 1. Create a `.env` file in your working directory:
 
 ```bash
+GHMLFS_BRANCH_MODE=false                 # Branch based Approach
 GHMLFS_SOURCE_ORGANIZATION=mona-actions  # Source organization name
 GHMLFS_SOURCE_HOSTNAME=                  # Source hostname
 GHMLFS_SOURCE_TOKEN=ghp_xxx              # Source token
