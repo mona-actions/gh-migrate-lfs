@@ -1,13 +1,13 @@
 package sync
 
 import (
+    "bufio"
     "encoding/csv"
     "fmt"
     "os"
     "os/exec"
     "path/filepath"
     "strings"
-    "bufio"
 
     "github.com/mona-actions/gh-migrate-lfs/pkg/common"
     "github.com/spf13/viper"
@@ -94,19 +94,18 @@ func SyncFromCSV() error {
 func SyncLFSContentMirrorMode(repoName, workDir, targetOrg, token string) error {
     repoPath := filepath.Join(workDir, repoName)
 
-    if err := configureGitAuth(token); err != nil {
-        return err
-    }
-
-    // Set environment variables
-    env := setupGitEnv()
+    env := os.Environ()
+    env = append(env, fmt.Sprintf("GITHUB_TOKEN=%s", token))
+    env = append(env, "GIT_TERMINAL_PROMPT=0")
 
     fmt.Printf("Syncing %s to %s/%s...\n", repoName, targetOrg, repoName)
 
-    // Set the remote URL without embedding the token
-    baseURL := fmt.Sprintf("https://github.com/%s/%s.git", targetOrg, repoName)
-    if err := setAndVerifyRemote(repoPath, baseURL, env); err != nil {
-        return err
+    baseURL := fmt.Sprintf("https://x-access-token:%s@github.com/%s/%s.git", token, targetOrg, repoName)
+
+    remoteCmd := exec.Command("git", "remote", "set-url", "origin", baseURL)
+    remoteCmd.Dir = repoPath
+    if err := remoteCmd.Run(); err != nil {
+        return fmt.Errorf("failed to set remote url: %w", err)
     }
 
     // Push all LFS content
@@ -125,19 +124,18 @@ func SyncLFSContentMirrorMode(repoName, workDir, targetOrg, token string) error 
 func SyncLFSContentBranchMode(repoName, workDir, targetOrg, token string) error {
     repoPath := filepath.Join(workDir, repoName)
 
-    if err := configureGitAuth(token); err != nil {
-        return err
-    }
-
-    // Set environment variables
-    env := setupGitEnv()
+    env := os.Environ()
+    env = append(env, fmt.Sprintf("GITHUB_TOKEN=%s", token))
+    env = append(env, "GIT_TERMINAL_PROMPT=0")
 
     fmt.Printf("Syncing %s to %s/%s...\n", repoName, targetOrg, repoName)
 
-    // Set the remote URL without embedding the token
-    baseURL := fmt.Sprintf("https://github.com/%s/%s.git", targetOrg, repoName)
-    if err := setAndVerifyRemote(repoPath, baseURL, env); err != nil {
-        return err
+    baseURL := fmt.Sprintf("https://x-access-token:%s@github.com/%s/%s.git", token, targetOrg, repoName)
+
+    remoteCmd := exec.Command("git", "remote", "set-url", "origin", baseURL)
+    remoteCmd.Dir = repoPath
+    if err := remoteCmd.Run(); err != nil {
+        return fmt.Errorf("failed to set remote url: %w", err)
     }
 
     // Get the default branch using symbolic-ref
@@ -222,48 +220,4 @@ func processBranch(repoPath, branchName string, env []string, token string) erro
 
     fmt.Printf("Successfully synced content for branch %s\n", branchName)
     return nil
-}
-
-func configureGitAuth(token string) error {
-    // Configure GitHub authentication
-    authCmd := exec.Command("sh", "-c", fmt.Sprintf("echo %q | gh auth login --with-token", token))
-    if output, err := authCmd.CombinedOutput(); err != nil {
-        return fmt.Errorf("❌ Failed to configure GitHub authentication: %s, %w", string(output), err)
-    }
-
-    // Configure git credential helper
-    credCmd := exec.Command("git", "config", "--global", "credential.helper", "!gh auth git-credential")
-    if output, err := credCmd.CombinedOutput(); err != nil {
-        return fmt.Errorf("❌ Failed to configure git credential helper: %s, %w", string(output), err)
-    }
-
-    return nil
-}
-
-func setAndVerifyRemote(repoPath, baseURL string, env []string) error {
-    // Set the remote URL
-    remoteCmd := exec.Command("git", "remote", "set-url", "origin", baseURL)
-    remoteCmd.Dir = repoPath
-    remoteCmd.Env = env
-    if err := remoteCmd.Run(); err != nil {
-        return fmt.Errorf("failed to set remote url: %w", err)
-    }
-
-    // Verify the remote URL
-    verifyCmd := exec.Command("git", "remote", "get-url", "origin")
-    verifyCmd.Dir = repoPath
-    verifyCmd.Env = env
-    output, err := verifyCmd.Output()
-    if err != nil {
-        return fmt.Errorf("failed to get remote url: %w", err)
-    }
-    remoteURL := strings.TrimSpace(string(output))
-    fmt.Printf("remote URL: %s\n", remoteURL)
-
-    return nil
-}
-
-// Helper function to set up git environment variables.
-func setupGitEnv() []string {
-    return append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 }
