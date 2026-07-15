@@ -76,17 +76,28 @@ func getNormalizedEndpoint(key string) string {
 		hostname = strings.TrimPrefix(hostname, "https://")
 		hostname = strings.TrimSuffix(hostname, "/api/v3")
 		hostname = strings.TrimSuffix(hostname, "/")
-		hostname = fmt.Sprintf("https://%s/api/v3", hostname)
+
+		if strings.HasSuffix(hostname, "ghe.com") {
+			// GitHub Enterprise Cloud with data residency uses an api.<tenant>.ghe.com endpoint.
+			hostname = strings.TrimPrefix(hostname, "api.")
+			hostname = fmt.Sprintf("https://api.%s", hostname)
+		} else {
+			// GitHub Enterprise Server exposes its REST API under /api/v3.
+			hostname = fmt.Sprintf("https://%s/api/v3", hostname)
+		}
 		viper.Set(key, hostname)
 	}
 	return hostname
 }
 
 func getHostnameMessage(hostname string) string {
-	if hostname != "" {
-		return fmt.Sprintf("\n💻 Using: GitHub Enterprise Server: %s", hostname)
+	if hostname == "" {
+		return "\n🌍 Using: GitHub.com"
 	}
-	return "\n🌍 Using: GitHub.com"
+	if strings.Contains(hostname, "ghe.com") {
+		return fmt.Sprintf("\n☁️ Using: GitHub Enterprise Cloud (data residency): %s", hostname)
+	}
+	return fmt.Sprintf("\n💻 Using: GitHub Enterprise Server: %s", hostname)
 }
 
 func getProxyStatus() string {

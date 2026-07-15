@@ -14,15 +14,40 @@ import (
 )
 
 type syncJob struct {
-    repoName  string
-    workDir   string
-    targetOrg string
+    repoName       string
+    workDir        string
+    targetOrg      string
+    targetHostname string
+}
+
+// buildGitHostname returns the hostname to use for git/LFS remote URLs.
+// An empty hostname defaults to github.com. Any scheme, /api/v3 suffix or
+// trailing slash is stripped. For GitHub Enterprise Cloud with data residency
+// (hosts ending in .ghe.com) the API "api." subdomain is removed so git remotes
+// point at the tenant host directly (e.g. api.acme.ghe.com -> acme.ghe.com).
+func buildGitHostname(hostname string) string {
+    hostname = strings.TrimSpace(hostname)
+    if hostname == "" {
+        return "github.com"
+    }
+
+    hostname = strings.TrimPrefix(hostname, "https://")
+    hostname = strings.TrimPrefix(hostname, "http://")
+    hostname = strings.TrimSuffix(hostname, "/api/v3")
+    hostname = strings.TrimSuffix(hostname, "/")
+
+    if strings.HasSuffix(hostname, ".ghe.com") {
+        hostname = strings.TrimPrefix(hostname, "api.")
+    }
+
+    return hostname
 }
 
 func SyncFromCSV() error {
     inputFile := viper.GetString("GHMLFS_FILE")
     workDir := viper.GetString("GHMLFS_WORK_DIR")
     targetOrg := viper.GetString("GHMLFS_TARGET_ORGANIZATION")
+    targetHostname := buildGitHostname(viper.GetString("GHMLFS_TARGET_HOSTNAME"))
     token := viper.GetString("GHMLFS_TARGET_TOKEN")
     maxWorkers := viper.GetInt("GHMLFS_WORKERS")
     branchMode := viper.GetBool("GHMLFS_BRANCH_MODE")
@@ -64,9 +89,10 @@ func SyncFromCSV() error {
             seen[repoName] = true
 
             jobs <- syncJob{
-                repoName:  repoName,
-                workDir:   workDir,
-                targetOrg: targetOrg,
+                repoName:       repoName,
+                workDir:        workDir,
+                targetOrg:      targetOrg,
+                targetHostname: targetHostname,
             }
         }
     }()
@@ -75,9 +101,9 @@ func SyncFromCSV() error {
     stats := common.NewProcessStats()
     err = common.WorkerPool(jobs, maxWorkers, stats, func(job syncJob) error {
         if branchMode {
-            return SyncLFSContentBranchMode(job.repoName, job.workDir, job.targetOrg, token)
+            return SyncLFSContentBranchMode(job.repoName, job.workDir, job.targetOrg, job.targetHostname, token)
         }
-        return SyncLFSContentMirrorMode(job.repoName, job.workDir, job.targetOrg, token)
+        return SyncLFSContentMirrorMode(job.repoName, job.workDir, job.targetOrg, job.targetHostname, token)
     })
 
     // Print summary
@@ -91,7 +117,7 @@ func SyncFromCSV() error {
     return nil
 }
 
-func SyncLFSContentMirrorMode(repoName, workDir, targetOrg, token string) error {
+func SyncLFSContentMirrorMode(repoName, workDir, targetOrg, targetHostname, token string) error {
     repoPath := filepath.Join(workDir, repoName)
 
     env := os.Environ()
@@ -100,7 +126,7 @@ func SyncLFSContentMirrorMode(repoName, workDir, targetOrg, token string) error 
 
     fmt.Printf("Syncing %s to %s/%s...\n", repoName, targetOrg, repoName)
 
-    baseURL := fmt.Sprintf("https://x-access-token:%s@github.com/%s/%s.git", token, targetOrg, repoName)
+    baseURL := fmt.Sprintf("https://x-access-token:%s@%s/%s/%s.git", token, targetHostname, targetOrg, repoName)
 
     remoteCmd := exec.Command("git", "remote", "set-url", "origin", baseURL)
     remoteCmd.Dir = repoPath
@@ -121,7 +147,7 @@ func SyncLFSContentMirrorMode(repoName, workDir, targetOrg, token string) error 
     return nil
 }
 
-func SyncLFSContentBranchMode(repoName, workDir, targetOrg, token string) error {
+func SyncLFSContentBranchMode(repoName, workDir, targetOrg, targetHostname, token string) error {
     repoPath := filepath.Join(workDir, repoName)
 
     env := os.Environ()
@@ -130,7 +156,7 @@ func SyncLFSContentBranchMode(repoName, workDir, targetOrg, token string) error 
 
     fmt.Printf("Syncing %s to %s/%s...\n", repoName, targetOrg, repoName)
 
-    baseURL := fmt.Sprintf("https://x-access-token:%s@github.com/%s/%s.git", token, targetOrg, repoName)
+    baseURL := fmt.Sprintf("https://x-access-token:%s@%s/%s/%s.git", token, targetHostname, targetOrg, repoName)
 
     remoteCmd := exec.Command("git", "remote", "set-url", "origin", baseURL)
     remoteCmd.Dir = repoPath
