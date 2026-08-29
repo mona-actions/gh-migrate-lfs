@@ -2,8 +2,10 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -11,281 +13,278 @@ import (
 
 	"github.com/google/go-github/v66/github"
 	"github.com/spf13/viper"
-	"golang.org/x/oauth2"
 )
 
-type ProxyConfig struct {
+type proxyConfig struct {
 	HTTPProxy  string
 	HTTPSProxy string
 	NoProxy    string
 }
 
-// Helper function to handle optional hostname parameter
-func getHostname(hostname ...string) string {
-	if len(hostname) > 0 {
-		return hostname[0]
-	}
-	return ""
-}
-
-func newGitHubClientWithHostname(token string, hostname string) (*github.Client, error) {
-	client, err := newGitHubClientWithProxy(token, GetProxyConfigFromEnv())
-	if err != nil {
-		return nil, err
+func newGitHubClient(token, hostname string) (*github.Client, error) {
+	if token == "" {
+		return nil, errors.New("GitHub token is required")
 	}
 
-	if hostname == "" {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = proxyFunc(proxyConfigFromEnvironment())
+	httpClient := &http.Client{Transport: transport, Timeout: 60 * time.Second}
+	client := github.NewClient(httpClient).WithAuthToken(token)
+	if strings.TrimSpace(hostname) == "" {
 		return client, nil
 	}
 
-	baseURL, err := url.Parse(hostname)
+	apiURL, uploadURL, err := enterpriseURLs(hostname)
 	if err != nil {
-		return nil, fmt.Errorf("invalid hostname URL provided (%s): %w", baseURL, err)
+		return nil, err
 	}
-
-	enterpriseClient, err := client.WithEnterpriseURLs(hostname, hostname)
+	client, err = client.WithEnterpriseURLs(apiURL, uploadURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to configure enterprise URLs for %s: %w", hostname, err)
+		return nil, fmt.Errorf("configure enterprise URLs: %w", err)
 	}
-
-	return enterpriseClient, nil
+	return client, nil
 }
 
-func newGitHubClientWithProxy(token string, proxyConfig *ProxyConfig) (*github.Client, error) {
-	if token == "" {
-		return nil, fmt.Errorf("GitHub token is required")
+func enterpriseURLs(hostname string) (string, string, error) {
+	hostname = strings.TrimSpace(hostname)
+	if !strings.Contains(hostname, "://") {
+		hostname = "https://" + hostname
+	}
+	parsed, err := url.Parse(hostname)
+	if err != nil || parsed.Host == "" {
+		return "", "", fmt.Errorf("invalid GitHub Enterprise hostname %q", hostname)
+	}
+	if parsed.User != nil {
+		return "", "", errors.New("GitHub Enterprise hostname must not contain credentials")
+	}
+	if parsed.Scheme != "https" && parsed.Hostname() != "localhost" {
+		return "", "", errors.New("GitHub Enterprise hostname must use HTTPS")
 	}
 
-	ctx := context.Background()
-	ts := oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: token},
-	)
-
-	transport := &http.Transport{
-		Proxy: func(req *http.Request) (*url.URL, error) {
-			if proxyConfig != nil && proxyConfig.NoProxy != "" {
-				noProxyURLs := strings.Split(proxyConfig.NoProxy, ",")
-				reqHost := req.URL.Host
-				for _, noProxy := range noProxyURLs {
-					if strings.TrimSpace(noProxy) == reqHost {
-						return nil, nil
-					}
-				}
-			}
-
-			if proxyConfig != nil {
-				if req.URL.Scheme == "https" && proxyConfig.HTTPSProxy != "" {
-					return url.Parse(proxyConfig.HTTPSProxy)
-				}
-				if req.URL.Scheme == "http" && proxyConfig.HTTPProxy != "" {
-					return url.Parse(proxyConfig.HTTPProxy)
-				}
-			}
-			return nil, nil
-		},
+	path := strings.TrimRight(parsed.Path, "/")
+	path = strings.TrimSuffix(path, "/api/v3")
+	if path != "" {
+		return "", "", fmt.Errorf("GitHub Enterprise hostname must not contain path %q", path)
 	}
-
-	tc := oauth2.NewClient(ctx, ts)
-	tc.Transport = &oauth2.Transport{
-		Base:   transport,
-		Source: ts,
-	}
-
-	return github.NewClient(tc), nil
+	origin := parsed.Scheme + "://" + parsed.Host
+	return origin + "/api/v3/", origin + "/uploads/", nil
 }
 
-func GetProxyConfigFromEnv() *ProxyConfig {
-	return &ProxyConfig{
+func RepositoryCloneURL(hostname, organization, repository string) (string, error) {
+	if organization == "" || repository == "" || strings.ContainsAny(organization+repository, "/\\") {
+		return "", errors.New("organization and repository must each be one path segment")
+	}
+	origin := "https://github.com"
+	if strings.TrimSpace(hostname) != "" {
+		apiURL, _, err := enterpriseURLs(hostname)
+		if err != nil {
+			return "", err
+		}
+		parsed, err := url.Parse(apiURL)
+		if err != nil {
+			return "", err
+		}
+		origin = parsed.Scheme + "://" + parsed.Host
+	}
+	return fmt.Sprintf("%s/%s/%s.git", origin, organization, repository), nil
+}
+
+func proxyFunc(config *proxyConfig) func(*http.Request) (*url.URL, error) {
+	return func(request *http.Request) (*url.URL, error) {
+		if config == nil {
+			return http.ProxyFromEnvironment(request)
+		}
+		requestHost := request.URL.Hostname()
+		for _, excluded := range strings.Split(config.NoProxy, ",") {
+			excluded = strings.TrimSpace(excluded)
+			if excluded != "" && (requestHost == excluded || strings.HasSuffix(requestHost, "."+strings.TrimPrefix(excluded, "."))) {
+				return nil, nil
+			}
+		}
+		if request.URL.Scheme == "https" && config.HTTPSProxy != "" {
+			return url.Parse(config.HTTPSProxy)
+		}
+		if request.URL.Scheme == "http" && config.HTTPProxy != "" {
+			return url.Parse(config.HTTPProxy)
+		}
+		return nil, nil
+	}
+}
+
+func proxyConfigFromEnvironment() *proxyConfig {
+	return &proxyConfig{
 		HTTPProxy:  viper.GetString("HTTP_PROXY"),
 		HTTPSProxy: viper.GetString("HTTPS_PROXY"),
 		NoProxy:    viper.GetString("NO_PROXY"),
 	}
 }
 
-func retryOperation(operation func() error) error {
-	maxRetries := viper.GetInt("MAX_RETRIES")
+func retryOperation(ctx context.Context, operation func() error) error {
+	maxRetries := viper.GetInt("GHMLFS_RETRY_MAX")
 	if maxRetries <= 0 {
-		maxRetries = 3 // fallback default
+		maxRetries = 3
+	}
+	retryDelay, err := time.ParseDuration(viper.GetString("GHMLFS_RETRY_DELAY"))
+	if err != nil || retryDelay <= 0 {
+		retryDelay = time.Second
 	}
 
-	retryDelay, err := time.ParseDuration(viper.GetString("RETRY_DELAY"))
-	if err != nil {
-		retryDelay = time.Second // fallback default
-	}
-
-	var apiErr error
+	var lastErr error
 	for attempt := 1; attempt <= maxRetries; attempt++ {
-		apiErr = operation()
-		if apiErr == nil {
-			return nil
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-
-		if attempt < maxRetries {
-			waitTime := retryDelay * time.Duration(1<<uint(attempt-1))
-			fmt.Printf("Attempt %d failed, retrying in %v: %v\n", attempt, waitTime, apiErr)
-			time.Sleep(waitTime)
+		lastErr = operation()
+		if lastErr == nil || !retryableError(lastErr) {
+			return lastErr
+		}
+		if attempt == maxRetries {
+			break
+		}
+		delay := min(retryDelay*time.Duration(1<<(attempt-1)), 16*time.Second)
+		fmt.Printf("Attempt %d failed, retrying in %v: %v\n", attempt, delay, lastErr)
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
 		}
 	}
-	return apiErr
+	return lastErr
 }
 
-func readContent(rc io.ReadCloser) (string, error) {
-	defer rc.Close()
-	content, err := io.ReadAll(rc)
-	if err != nil {
-		return "", err
+func retryableError(err error) bool {
+	var responseError *github.ErrorResponse
+	if errors.As(err, &responseError) && responseError.Response != nil {
+		status := responseError.Response.StatusCode
+		return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
 	}
-	return string(content), nil
+	var rateLimitError *github.RateLimitError
+	if errors.As(err, &rateLimitError) {
+		return true
+	}
+	var abuseRateLimitError *github.AbuseRateLimitError
+	if errors.As(err, &abuseRateLimitError) {
+		return true
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError)
 }
 
-func CheckGitAttributes(org, repo, token string, depth int, hostname ...string) (bool, string, error) {
-	client, err := newGitHubClientWithHostname(token, getHostname(hostname...))
+func FindLFSAttributes(ctx context.Context, org, repo, token string, depth int, hostname string) (bool, string, error) {
+	client, err := newGitHubClient(token, hostname)
 	if err != nil {
-		return false, "", fmt.Errorf("failed to initialize GitHub client: %w", err)
+		return false, "", fmt.Errorf("initialize GitHub client: %w", err)
+	}
+	if depth < 1 {
+		depth = 1
 	}
 
-	ctx := context.Background()
-	var foundPath string
-	var hasLFS bool
-
-	visited := make(map[string]bool)
-
-	var searchDir func(path string, currentDepth int) error
-	searchDir = func(path string, currentDepth int) error {
+	var searchDir func(string, int) (bool, string, error)
+	searchDir = func(path string, currentDepth int) (bool, string, error) {
 		if currentDepth > depth {
-			return nil
+			return false, "", nil
 		}
 
-		if visited[path] {
-			return nil
-		}
-		visited[path] = true
-
-		err := retryOperation(func() error {
-			opts := &github.RepositoryContentGetOptions{}
-
-			fileContent, dirContent, resp, err := client.Repositories.GetContents(ctx, org, repo, path, opts)
-			if err != nil {
-				if resp != nil && resp.StatusCode == http.StatusNotFound {
-					return nil
-				}
-				return fmt.Errorf("error fetching contents of %s: %w", path, err)
-			}
-
-			// Check single file
-			if fileContent != nil && fileContent.GetName() == ".gitattributes" {
-				rawContent, _, err := client.Repositories.DownloadContents(ctx, org, repo, fileContent.GetPath(), opts)
-				if err != nil {
-					return fmt.Errorf("error reading content: %w", err)
-				}
-
-				content, err := readContent(rawContent)
-				if err != nil {
-					return fmt.Errorf("error reading raw content: %w", err)
-				}
-
-				if strings.Contains(content, "filter=lfs") {
-					hasLFS = true
-					foundPath = fileContent.GetPath()
-					return nil // Successfully found LFS, not an error
-				}
-			}
-
-			// Check directory
-			if dirContent != nil {
-				for _, item := range dirContent {
-					if item.GetType() == "file" && item.GetName() == ".gitattributes" {
-						rawContent, _, err := client.Repositories.DownloadContents(ctx, org, repo, item.GetPath(), opts)
-						if err != nil {
-							return fmt.Errorf("error reading content: %w", err)
-						}
-
-						content, err := readContent(rawContent)
-						if err != nil {
-							return fmt.Errorf("error reading raw content: %w", err)
-						}
-
-						if strings.Contains(content, "filter=lfs") {
-							hasLFS = true
-							foundPath = item.GetPath()
-							return nil // Successfully found LFS, not an error
-						}
-					}
-				}
-
-				// Only continue searching if we haven't found LFS yet
-				if !hasLFS {
-					for _, item := range dirContent {
-						if item.GetType() == "dir" {
-							if err := searchDir(item.GetPath(), currentDepth+1); err != nil {
-								return err
-							}
-							// If we found LFS in a subdirectory, stop searching
-							if hasLFS {
-								return nil
-							}
-						}
-					}
-				}
-			}
-
-			return nil
+		var fileContent *github.RepositoryContent
+		var dirContent []*github.RepositoryContent
+		var response *github.Response
+		err := retryOperation(ctx, func() error {
+			var requestErr error
+			fileContent, dirContent, response, requestErr = client.Repositories.GetContents(ctx, org, repo, path, nil)
+			return requestErr
 		})
+		if err != nil {
+			if response != nil && response.StatusCode == http.StatusNotFound {
+				return false, "", nil
+			}
+			return false, "", fmt.Errorf("fetch contents of %q: %w", path, err)
+		}
 
-		return err
+		if fileContent != nil && fileContent.GetName() == ".gitattributes" {
+			matched, err := gitAttributesUsesLFS(ctx, client, org, repo, fileContent.GetPath())
+			return matched, fileContent.GetPath(), err
+		}
+		for _, item := range dirContent {
+			if item.GetType() != "file" || item.GetName() != ".gitattributes" {
+				continue
+			}
+			matched, err := gitAttributesUsesLFS(ctx, client, org, repo, item.GetPath())
+			if err != nil || matched {
+				return matched, item.GetPath(), err
+			}
+		}
+		for _, item := range dirContent {
+			if item.GetType() != "dir" {
+				continue
+			}
+			matched, foundPath, err := searchDir(item.GetPath(), currentDepth+1)
+			if err != nil || matched {
+				return matched, foundPath, err
+			}
+		}
+		return false, "", nil
 	}
 
-	err = searchDir("", 1)
+	matched, foundPath, err := searchDir("", 1)
 	if err != nil {
-		return false, "", fmt.Errorf("error searching repository: %w", err)
+		return false, "", fmt.Errorf("search repository: %w", err)
 	}
-
-	return hasLFS, foundPath, nil
+	return matched, foundPath, nil
 }
 
-func GetRepositories(org, token string, hostname ...string) ([]string, error) {
-	if org == "" {
-		return nil, fmt.Errorf("organization name is required")
-	}
-
-	client, err := newGitHubClientWithHostname(token, getHostname(hostname...))
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize GitHub client: %w", err)
-	}
-
-	var allRepos []string
-	opts := &github.RepositoryListByOrgOptions{
-		ListOptions: github.ListOptions{PerPage: 100},
-	}
-
-	err = retryOperation(func() error {
-		for {
-			repos, resp, apiErr := client.Repositories.ListByOrg(context.Background(), org, opts)
-			if apiErr != nil {
-				return apiErr
-			}
-
-			if repos == nil {
-				return fmt.Errorf("no repositories data returned for organization %s", org)
-			}
-
-			for _, repo := range repos {
-				if repo != nil && repo.Name != nil {
-					allRepos = append(allRepos, *repo.Name)
-				}
-			}
-
-			if resp == nil || resp.NextPage == 0 {
-				break
-			}
-			opts.Page = resp.NextPage
+func gitAttributesUsesLFS(ctx context.Context, client *github.Client, org, repo, path string) (bool, error) {
+	var content string
+	err := retryOperation(ctx, func() error {
+		reader, _, err := client.Repositories.DownloadContents(ctx, org, repo, path, nil)
+		if err != nil {
+			return err
 		}
+		defer reader.Close()
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			return err
+		}
+		content = string(data)
 		return nil
 	})
-
 	if err != nil {
-		return nil, fmt.Errorf("failed to list repositories for %s: %w", org, err)
+		return false, fmt.Errorf("read %s: %w", path, err)
+	}
+	return strings.Contains(content, "filter=lfs"), nil
+}
+
+func ListRepositories(ctx context.Context, org, token, hostname string) ([]string, error) {
+	if org == "" {
+		return nil, errors.New("organization name is required")
+	}
+	client, err := newGitHubClient(token, hostname)
+	if err != nil {
+		return nil, fmt.Errorf("initialize GitHub client: %w", err)
 	}
 
-	return allRepos, nil
+	var repositories []string
+	opts := &github.RepositoryListByOrgOptions{ListOptions: github.ListOptions{PerPage: 100}}
+	for {
+		var page []*github.Repository
+		var response *github.Response
+		err := retryOperation(ctx, func() error {
+			var requestErr error
+			page, response, requestErr = client.Repositories.ListByOrg(ctx, org, opts)
+			return requestErr
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list repositories for %s: %w", org, err)
+		}
+		for _, repository := range page {
+			if repository.GetName() != "" {
+				repositories = append(repositories, repository.GetName())
+			}
+		}
+		if response == nil || response.NextPage == 0 {
+			return repositories, nil
+		}
+		opts.Page = response.NextPage
+	}
 }

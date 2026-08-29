@@ -1,198 +1,143 @@
 package pull
 
 import (
-    "encoding/csv"
-    "fmt"
-    "io"
-    "os"
-    "os/exec"
-    "path/filepath"
-    "strings"
+	"context"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 
-    "github.com/mona-actions/gh-migrate-lfs/pkg/common"
-    "github.com/pterm/pterm"
-    "github.com/spf13/viper"
+	"github.com/mona-actions/gh-migrate-lfs/internal/manifest"
+	"github.com/mona-actions/gh-migrate-lfs/internal/worker"
+	"github.com/pterm/pterm"
 )
 
-type pullJob struct {
-    name     string
-    cloneURL string
+type Config struct {
+	InputFile string
+	Token     string
+	WorkDir   string
+	Workers   int
 }
 
-func PullLFSFromCSV() error {
-    inputFile := viper.GetString("GHMLFS_FILE")
-    token := viper.GetString("GHMLFS_SOURCE_TOKEN")
-    workDir := viper.GetString("GHMLFS_WORK_DIR")
-    maxWorkers := viper.GetInt("GHMLFS_WORKERS")
-    branchMode := viper.GetBool("GHMLFS_BRANCH_MODE")
-
-    // Ensure at least 1 worker
-    if maxWorkers <= 0 {
-        maxWorkers = 1
-    }
-
-	if branchMode {
-		pterm.Info.Printf("Mode: Branching\n")
-	} else {
-		pterm.Info.Printf("Mode: Mirroring\n")
+func Run(ctx context.Context, cfg Config) error {
+	repositories, err := manifest.Load(cfg.InputFile)
+	if err != nil {
+		return err
 	}
 
-    // Read CSV file
-    file, err := os.Open(inputFile)
-    if err != nil {
-        return fmt.Errorf("error opening input file: %w", err)
-    }
-    defer file.Close()
+	jobChannel := make(chan manifest.Repository, len(repositories))
+	for _, repository := range repositories {
+		jobChannel <- repository
+	}
+	close(jobChannel)
 
-    reader := csv.NewReader(file)
-    // Skip header
-    if _, err := reader.Read(); err != nil {
-        return fmt.Errorf("error reading CSV header: %w", err)
-    }
+	stats := worker.NewStats()
+	err = worker.Run(ctx, jobChannel, max(cfg.Workers, 1), stats, func(repository manifest.Repository) error {
+		gitEnv, err := gitAuthEnvironment(repository.CloneURL, cfg.Token)
+		if err != nil {
+			return fmt.Errorf("%s: %w", repository.Name, err)
+		}
+		return pullRepository(ctx, repository.Name, repository.CloneURL, cfg.WorkDir, gitEnv)
+	})
+	stats.PrintSummary(cfg.WorkDir)
+	if err != nil {
+		return err
+	}
 
-    // Create jobs channel and track unique repositories
-    jobs := make(chan pullJob)
-    seen := make(map[string]bool)
-
-    // Start goroutine to send jobs
-    go func() {
-        defer close(jobs)
-        for {
-            record, err := reader.Read()
-            if err != nil {
-                if err == io.EOF {
-                    break
-                }
-                fmt.Printf("Error reading CSV record: %v\n", err)
-                continue
-            }
-            if len(record) != 3 {
-                fmt.Printf("Invalid CSV record format, expected 3 columns got %d\n", len(record))
-                continue
-            }
-
-            repoName := record[0]
-            if seen[repoName] {
-                continue
-            }
-            seen[repoName] = true
-
-            jobs <- pullJob{
-                name:     repoName,
-                cloneURL: record[2],
-            }
-        }
-    }()
-
-    // Create and run worker pool
-    stats := common.NewProcessStats()
-    err = common.WorkerPool(jobs, maxWorkers, stats, func(job pullJob) error {
-        // Authenticate URL here, in the worker
-        urlParts := strings.SplitN(job.cloneURL, "://", 2)
-        if len(urlParts) != 2 {
-            return fmt.Errorf("invalid clone URL format for %s", job.name)
-        }
-        authenticatedURL := fmt.Sprintf("%s://%s@%s", urlParts[0], token, urlParts[1])
-
-        if branchMode {
-            return PullLFSContentBranchMode(job.name, authenticatedURL, token, workDir)
-        }
-        return PullLFSContentMirrorMode(job.name, authenticatedURL, token, workDir)
-    })
-
-    // Print summary
-    stats.PrintSummary(workDir)
-
-    if err != nil {
-        return err
-    }
-
-    fmt.Println("\n✅ Pull completed successfully!")
-    return nil
+	fmt.Println("\nPull completed successfully!")
+	return nil
 }
 
-func PullLFSContentMirrorMode(repoName, cloneURL, token, workDir string) error {
-    repoPath := filepath.Join(workDir, repoName)
+func pullRepository(ctx context.Context, repoName, cloneURL, workDir string, gitEnv []string) error {
+	repoPath := filepath.Join(workDir, repoName)
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		return fmt.Errorf("create working directory: %w", err)
+	}
 
-    // Create working directory if it doesn't exist
-    if err := os.MkdirAll(workDir, 0755); err != nil {
-        return fmt.Errorf("❌ Failed to create working directory: %w", err)
-    }
+	exists, err := directoryExists(repoPath)
+	if err != nil {
+		return err
+	}
+	if exists {
+		pterm.Info.Printf("Repository exists '%s', proceeding with update\n", repoName)
+		if err := runGit(ctx, repoPath, gitEnv, "remote", "set-url", "origin", cloneURL); err != nil {
+			return fmt.Errorf("set clean origin URL: %w", err)
+		}
+		if err := runGit(ctx, repoPath, gitEnv, "fetch", "--prune", "origin", "+refs/*:refs/*"); err != nil {
+			return fmt.Errorf("update mirror: %w", err)
+		}
+	} else {
+		pterm.Info.Printf("Cloning repository '%s'...\n", repoName)
+		if err := runGit(ctx, workDir, gitEnv, "clone", "--mirror", "--bare", cloneURL, repoName); err != nil {
+			return fmt.Errorf("clone mirror: %w", err)
+		}
+	}
 
-    // Check if the repository already exists
-    if _, err := os.Stat(repoPath); err == nil {
-        pterm.Info.Printf("Repository exists '%s', proceeding with update\n", repoName)
-
-        pullCmd := exec.Command("git", "fetch", "--prune", "origin", "+refs/*:refs/*")
-        pullCmd.Dir = repoPath
-        if output, err := pullCmd.CombinedOutput(); err != nil {
-            return fmt.Errorf("❌ Failed to pull updates: %s, %w", string(output), err)
-        }
-
-        lfsPullCmd := exec.Command("git", "lfs", "fetch", "--all")
-        lfsPullCmd.Dir = repoPath
-        if output, err := lfsPullCmd.CombinedOutput(); err != nil {
-            return fmt.Errorf("❌ Failed to pull LFS content: %s, %w", string(output), err)
-        }
-
-        pterm.Success.Printf("Synchronization with '%s' completed successfully\n", repoName)
-        return nil
-    }
-
-    pterm.Info.Printf("Cloning repository '%s'...\n", repoName)
-    cloneCmd := exec.Command("git", "clone", "--mirror", "--bare", cloneURL, repoName)
-    cloneCmd.Dir = workDir
-    if output, err := cloneCmd.CombinedOutput(); err != nil {
-        errMsg := strings.ReplaceAll(string(output), token, "****")
-        return fmt.Errorf("❌ Failed to clone repository: %s, %w", errMsg, err)
-    }
-
-    pterm.Info.Printf("Pulling LFS objects for repository '%s'...\n", repoName)
-
-    lfsPullCmd := exec.Command("git", "lfs", "fetch", "--all")
-    lfsPullCmd.Dir = repoPath
-    if output, err := lfsPullCmd.CombinedOutput(); err != nil {
-        return fmt.Errorf("❌ Failed to fetch LFS content: %s, %w", string(output), err)
-    }
-
-    pterm.Success.Printf("synchronized: %s\n", repoName)
-    return nil
+	if err := runGit(ctx, repoPath, gitEnv, "lfs", "fetch", "--all"); err != nil {
+		return fmt.Errorf("fetch LFS objects: %w", err)
+	}
+	pterm.Success.Printf("synchronized: %s\n", repoName)
+	return nil
 }
 
-func PullLFSContentBranchMode(repoName, cloneURL, token, workDir string) error {
-    repoPath := filepath.Join(workDir, repoName)
+func gitAuthEnvironment(rawURL, token string) ([]string, error) {
+	if token == "" {
+		return nil, errors.New("GitHub token is required")
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" {
+		return nil, fmt.Errorf("invalid clone URL %q", rawURL)
+	}
+	if parsed.User != nil {
+		return nil, errors.New("clone URL must not contain credentials")
+	}
+	if parsed.Scheme != "https" && parsed.Hostname() != "localhost" {
+		return nil, errors.New("clone URL must use HTTPS")
+	}
 
-    // Create working directory if it doesn't exist
-    if err := os.MkdirAll(workDir, 0755); err != nil {
-        return fmt.Errorf("❌ Failed to create working directory: %w", err)
-    }
+	auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+	scope := fmt.Sprintf("http.%s://%s/.extraheader", parsed.Scheme, parsed.Host)
+	return append(os.Environ(),
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_TRACE_REDACT=1",
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0="+scope,
+		"GIT_CONFIG_VALUE_0=Authorization: Basic "+auth,
+	), nil
+}
 
-    // Check if the repository already exists
-    if _, err := os.Stat(repoPath); err == nil {
-        pterm.Info.Printf("Repository exists '%s', proceeding with update\n", repoName)
-        
-        fetchCmd := exec.Command("git", "fetch", "--all")
-        fetchCmd.Dir = repoPath
-        if output, err := fetchCmd.CombinedOutput(); err != nil {
-            return fmt.Errorf("❌ Failed to fetch updates: %s, %w", string(output), err)
-        }
-    } else {
-        pterm.Info.Printf("Cloning repository '%s'...\n", repoName)
-        cloneCmd := exec.Command("git", "clone", cloneURL)
-        cloneCmd.Dir = workDir
-        if output, err := cloneCmd.CombinedOutput(); err != nil {
-            errMsg := strings.ReplaceAll(string(output), token, "****")
-            return fmt.Errorf("❌ Failed to clone repository: %s, %w", errMsg, err)
-        }
-    }
+func runGit(ctx context.Context, dir string, env []string, args ...string) error {
+	command := exec.CommandContext(ctx, "git", args...)
+	command.Dir = dir
+	command.Env = env
+	output, err := command.CombinedOutput()
+	if err != nil {
+		message := strings.TrimSpace(string(output))
+		if message == "" {
+			return err
+		}
+		return fmt.Errorf("%w: %s", err, message)
+	}
+	return nil
+}
 
-    // Pull LFS content for all branches
-    lfsPullCmd := exec.Command("git", "lfs", "fetch", "--all")
-    lfsPullCmd.Dir = repoPath
-    if output, err := lfsPullCmd.CombinedOutput(); err != nil {
-        return fmt.Errorf("❌ Failed to pull LFS content: %s, %w", string(output), err)
-    }
-
-    pterm.Success.Printf("synchronized: %s\n", repoName)
-    return nil
+func directoryExists(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect repository path: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return false, fmt.Errorf("repository path must not be a symbolic link: %s", path)
+	}
+	if !info.IsDir() {
+		return false, fmt.Errorf("repository path is not a directory: %s", path)
+	}
+	return true, nil
 }

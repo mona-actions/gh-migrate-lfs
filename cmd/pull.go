@@ -2,45 +2,52 @@ package cmd
 
 import (
 	"fmt"
+	"os/exec"
 
 	"github.com/mona-actions/gh-migrate-lfs/pkg/pull"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 )
 
 var pullCmd = &cobra.Command{
 	Use:   "pull",
 	Short: "Does a git clone and lfs pull on exported repositories",
 	Long:  "Does a git clone and lfs pull on exported repositories",
-	Run: func(cmd *cobra.Command, args []string) {
-		GetFlagOrEnv(cmd, map[string]bool{
-			"GHMLFS_BRANCH_MODE":     false,
-			"GHMLFS_FILE":            true,
-			"GHMLFS_SOURCE_HOSTNAME": false,
-			"GHMLFS_SOURCE_TOKEN":    true,
-			"GHMLFS_WORK_DIR":        true,
-			"GHMLFS_WORKERS":         false,
-		})
-
-		ShowConnectionStatus("pull")
-		if err := pull.PullLFSFromCSV(); err != nil {
-			fmt.Printf("failed to export lfs repositories: %v\n", err)
+	Args:  cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := checkGitLFS(cmd); err != nil {
+			return fmt.Errorf("git lfs command not found; install Git LFS from https://git-lfs.com: %w", err)
 		}
+		manifestPath := stringConfig(cmd, "file", "GHMLFS_FILE")
+		sourceToken := stringConfig(cmd, "source-token", "GHMLFS_SOURCE_TOKEN")
+		workDir := stringConfig(cmd, "work-dir", "GHMLFS_WORK_DIR")
+		if err := requireValues(map[string]string{
+			"file":         manifestPath,
+			"source-token": sourceToken,
+			"work-dir":     workDir,
+		}); err != nil {
+			return err
+		}
+
+		if err := pull.Run(cmd.Context(), pull.Config{
+			InputFile: manifestPath,
+			Token:     sourceToken,
+			WorkDir:   workDir,
+			Workers:   intConfig(cmd, "workers", "GHMLFS_WORKERS"),
+		}); err != nil {
+			return fmt.Errorf("pull LFS repositories: %w", err)
+		}
+		return nil
 	},
 }
 
+func checkGitLFS(cmd *cobra.Command) error {
+	return exec.CommandContext(cmd.Context(), "git", "lfs", "--version").Run()
+}
+
 func init() {
-	pullCmd.Flags().BoolP("branch-mode", "b", false, "Branch based approach (default false)")
 	pullCmd.Flags().StringP("file", "f", "", "Exported LFS repos file path, csv format (required)")
-	pullCmd.Flags().StringP("source-hostname", "n", "", "GitHub Enterprise Server hostname URL (optional)")
 	pullCmd.Flags().StringP("source-token", "t", "", "GitHub token with repo scope (required)")
 	pullCmd.Flags().StringP("work-dir", "d", "", "Working directory with cloned repositories (required)")
-	pullCmd.Flags().IntP("workers", "w", 1, "Number of concurrent GIT workers to use")
+	pullCmd.Flags().IntP("workers", "w", 1, "Number of repositories to pull concurrently")
 
-	viper.BindPFlag("GHMLFS_BRANCH_MODE", pullCmd.Flags().Lookup("branch-mode"))
-	viper.BindPFlag("GHMLFS_FILE", pullCmd.Flags().Lookup("file"))
-	viper.BindPFlag("GHMLFS_SOURCE_HOSTNAME", pullCmd.Flags().Lookup("source-hostname"))
-	viper.BindPFlag("GHMLFS_SOURCE_TOKEN", pullCmd.Flags().Lookup("source-token"))
-	viper.BindPFlag("GHMLFS_WORK_DIR", pullCmd.Flags().Lookup("work-dir"))
-	viper.BindPFlag("GHMLFS_WORKERS", pullCmd.Flags().Lookup("workers"))
 }

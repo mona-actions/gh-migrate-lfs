@@ -2,96 +2,102 @@ package cmd
 
 import (
 	"fmt"
-	"os"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
 
-func GetFlagOrEnv(cmd *cobra.Command, flags map[string]bool) map[string]string {
-	values := make(map[string]string)
+func requireValues(fields map[string]string) error {
 	var missing []string
-
-	for name, required := range flags {
-		// For CLI flags, strip GHMLFS_ prefix if present
-		flagName := strings.TrimPrefix(strings.ToLower(name), "ghmlfs_")
-		flagName = strings.ReplaceAll(flagName, "_", "-")
-
-		// For env vars, ensure GHMLFS_ prefix
-		envName := name
-		if !strings.HasPrefix(strings.ToUpper(name), "GHMLFS_") {
-			envName = "GHMLFS_" + strings.ToUpper(strings.ReplaceAll(name, "-", "_"))
-		}
-
-		// Check all possible sources
-		flagVal, _ := cmd.Flags().GetString(flagName)
-		envVal := viper.GetString(envName)
-
-		value := ""
-		if flagVal != "" {
-			value = flagVal
-		} else if envVal != "" {
-			value = envVal
-		}
-
-		if value != "" {
-			// Store both versions to ensure consistency
-			viper.Set(flagName, value)
-			viper.Set(envName, value)
-			values[name] = value
-		} else if required {
-			missing = append(missing, flagName)
+	for name, value := range fields {
+		if strings.TrimSpace(value) == "" {
+			missing = append(missing, name)
 		}
 	}
-
-	if len(missing) > 0 {
-		fmt.Fprintf(os.Stderr, "Error: missing required values: %s\n", strings.Join(missing, ", "))
-		os.Exit(1)
+	if len(missing) == 0 {
+		return nil
 	}
 
-	return values
+	sort.Strings(missing)
+	return fmt.Errorf("missing required values: %s", strings.Join(missing, ", "))
 }
 
-func ShowConnectionStatus(actionType string) {
-	var endpoint string
-
-	switch actionType {
-	case "export", "pull":
-		endpoint = "source-hostname"
-	case "sync":
-		endpoint = "target-hostname"
+func stringConfig(cmd *cobra.Command, flagName, key string) string {
+	if cmd.Flags().Changed(flagName) {
+		value, _ := cmd.Flags().GetString(flagName)
+		return value
 	}
-
-	hostname := getNormalizedEndpoint(endpoint)
-
-	fmt.Println(getHostnameMessage(hostname))
-	fmt.Println(getProxyStatus())
+	if viper.IsSet(key) {
+		return viper.GetString(key)
+	}
+	value, _ := cmd.Flags().GetString(flagName)
+	return value
 }
 
-func getNormalizedEndpoint(key string) string {
-	hostname := viper.GetString(key)
+func intConfig(cmd *cobra.Command, flagName, key string) int {
+	if cmd.Flags().Changed(flagName) {
+		value, _ := cmd.Flags().GetInt(flagName)
+		return value
+	}
+	if viper.IsSet(key) {
+		return viper.GetInt(key)
+	}
+	value, _ := cmd.Flags().GetInt(flagName)
+	return value
+}
+
+func boolConfig(cmd *cobra.Command, flagName, key string) bool {
+	if cmd.Flags().Changed(flagName) {
+		value, _ := cmd.Flags().GetBool(flagName)
+		return value
+	}
+	if viper.IsSet(key) {
+		return viper.GetBool(key)
+	}
+	value, _ := cmd.Flags().GetBool(flagName)
+	return value
+}
+
+func durationConfig(cmd *cobra.Command, flagName, key string) (time.Duration, error) {
+	value := stringConfig(cmd, flagName, key)
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", flagName, value, err)
+	}
+	return duration, nil
+}
+
+func showConnectionStatus(hostname string) {
+	hostname = normalizedAPIEndpoint(hostname)
+	fmt.Println(hostnameMessage(hostname))
+	fmt.Println(proxyStatus())
+}
+
+func normalizedAPIEndpoint(hostname string) string {
+	hostname = strings.TrimSpace(hostname)
+	if hostname == "" {
+		return ""
+	}
+	hostname = strings.TrimPrefix(hostname, "http://")
+	hostname = strings.TrimPrefix(hostname, "https://")
+	hostname = strings.TrimSuffix(hostname, "/api/v3")
+	hostname = strings.TrimSuffix(hostname, "/")
+	return "https://" + hostname + "/api/v3"
+}
+
+func hostnameMessage(hostname string) string {
 	if hostname != "" {
-		hostname = strings.TrimPrefix(hostname, "http://")
-		hostname = strings.TrimPrefix(hostname, "https://")
-		hostname = strings.TrimSuffix(hostname, "/api/v3")
-		hostname = strings.TrimSuffix(hostname, "/")
-		hostname = fmt.Sprintf("https://%s/api/v3", hostname)
-		viper.Set(key, hostname)
+		return fmt.Sprintf("\nUsing GitHub Enterprise Server: %s", hostname)
 	}
-	return hostname
+	return "\nUsing GitHub.com"
 }
 
-func getHostnameMessage(hostname string) string {
-	if hostname != "" {
-		return fmt.Sprintf("\n💻 Using: GitHub Enterprise Server: %s", hostname)
-	}
-	return "\n🌍 Using: GitHub.com"
-}
-
-func getProxyStatus() string {
+func proxyStatus() string {
 	if viper.GetString("HTTP_PROXY") != "" || viper.GetString("HTTPS_PROXY") != "" {
-		return "✅ Proxy: Configured\n"
+		return "Proxy: configured\n"
 	}
-	return "❎ Proxy: Not configured\n"
+	return "Proxy: not configured\n"
 }

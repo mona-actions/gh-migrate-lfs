@@ -1,13 +1,13 @@
 module github.com/mona-actions/gh-migrate-lfs
 
-go 1.23.3
+go 1.27.0
 
 require (
+	github.com/gofrs/flock v0.12.1
 	github.com/google/go-github/v66 v66.0.0
 	github.com/pterm/pterm v0.12.80
 	github.com/spf13/cobra v1.8.1
 	github.com/spf13/viper v1.19.0
-	golang.org/x/oauth2 v0.24.0
 )
 
 require (
