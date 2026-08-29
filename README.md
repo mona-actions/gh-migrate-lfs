@@ -1,9 +1,20 @@
 # gh-migrate-lfs
 
-![build](https://github.com/mona-actions/gh-migrate-lfs/actions/workflows/build.yml/badge.svg)
-![GitHub Release](https://img.shields.io/github/v/release/mona-actions/gh-migrate-lfs)
+[![build](https://github.com/mona-actions/gh-migrate-lfs/actions/workflows/build.yml/badge.svg)](https://github.com/mona-actions/gh-migrate-lfs/actions/workflows/build.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/mona-actions/gh-migrate-lfs)](https://github.com/mona-actions/gh-migrate-lfs/releases)
 
-`gh-migrate-lfs` is a [GitHub CLI](https://cli.github.com) extension to assist in the migration of Git LFS files between GitHub organizations. While [GitHub Enterprise Importer](https://github.com/github/gh-gei) handles many aspects of organization migration, there can be challenges with large Git LFS files. This extension helps ensure all your LFS content is properly migrated. Whether you're consolidating organizations, setting up new environments, or need to replicate repositories with LFS content, this extension can help.
+A GitHub CLI extension for migrating Git LFS objects between GitHub organizations and GitHub Enterprise Server instances.
+
+The extension discovers repositories using LFS, downloads their source objects, and uploads only objects missing from the destination.
+
+## Requirements
+
+- GitHub CLI
+- Git and Git LFS for `migrate` and `pull`
+- Existing destination repositories and refs
+- Source and destination tokens with repository access
+
+`export` and `sync` do not require Git LFS.
 
 ## Install
 
@@ -11,283 +22,212 @@
 gh extension install mona-actions/gh-migrate-lfs
 ```
 
-## Upgrade
+Upgrade an existing installation:
 
-```sh
+```bash
 gh extension upgrade gh-migrate-lfs
 ```
 
-## LFS Migration Types
+## Migrate End to End
 
-This tool offers offers a **branch** and **mirror** based approach to migrate LFS content.
-
-- **Mirror-Based Approach**
-  - Ideal for smaller repositories.
-  - Offers quick pull and push capabilities, potentially reducing time.
-- **Branch-Based Approach**
-  - Tailored for larger repositories where reliability is crucial.
-  - Can handle network interruptions, allowing the migration to continue from the last successful point rather than starting over from scratch.
-  - Pushes the default branch first 
-Provides resilience against disruptions during the migration process.
-
-Export is the first step and is used to export a list of repositories containing Git LFS files to a CSV file and we do this by looking for `.gitattributes` files in the repositories. Pull is the second step and is used to clone the repositories and download their LFS objects. Sync is the third step and is used to push the LFS objects to the target repository.
-
-Doing the pull ahead of the migration is recommended, especially for larger or active repositories. The pull step is also capable of fetching updates to the repositories if they have been updated since the last pull.
-
-## Usage: Export
-
-Export a list of repositories containing Git LFS files to a CSV file.
+Run discovery, source download, and destination upload with one command:
 
 ```bash
-Usage:
-  migrate-lfs export [flags]
-
-Flags:
-  -h, --help                         help for export
-  -s, --search-depth string          Search depth for .gitattributes file
-  -n, --source-hostname string       GitHub Enterprise Server hostname URL (optional)
-  -o, --source-organization string   Organization (required)
-  -t, --source-token string          GitHub token (required)
+gh migrate-lfs migrate \
+  --source-organization source-org \
+  --source-token "$SOURCE_TOKEN" \
+  --target-organization target-org \
+  --target-token "$TARGET_TOKEN" \
+  --work-dir ./lfs-migration
 ```
 
-### Example Export Command
+This command:
+
+1. Exports repositories containing LFS configuration.
+2. Creates or updates bare source mirrors and runs `git lfs fetch --all`.
+3. Uploads missing objects directly through the destination LFS Batch API.
+4. Reconciles destination state and writes a run report.
+
+The generated manifest is retained at:
+
+```text
+./lfs-migration/source-org_lfs.csv
+```
+
+To use an existing or curated manifest, pass `--file` instead of `--source-organization`:
+
+```bash
+gh migrate-lfs migrate \
+  --file ./lfs-migration/source-org_lfs.csv \
+  --source-token "$SOURCE_TOKEN" \
+  --target-organization target-org \
+  --target-token "$TARGET_TOKEN" \
+  --work-dir ./lfs-migration
+```
+
+`--file` and `--source-organization` are mutually exclusive when both are passed as flags.
+
+## How Sync Works
+
+Sync does not invoke `git` or `git lfs`. It:
+
+- Streams canonical objects from `.git/lfs/objects` or `lfs/objects` in bounded batches.
+- Negotiates every local OID with the destination.
+- Uploads only objects for which the server returns an upload action.
+- Reconciles every processed object after upload.
+
+The destination is authoritative. There are no local completion checkpoints: rerunning safely renegotiates all OIDs and skips objects already present remotely.
+
+With `--check-hashes`, corrupt objects are reported and excluded while healthy objects continue processing.
+
+## Staged Workflow
+
+Each phase can also run independently.
+
+### Export
 
 ```bash
 gh migrate-lfs export \
-  --source-organization mona-actions \
-  --source-token ghp_xxxxxxxxxxxx \
+  --source-organization source-org \
+  --source-token "$SOURCE_TOKEN" \
   --search-depth 2
 ```
 
-This will create a file named `{organization}_lfs.csv` containing all repositories with LFS files. The export process provides additional feedback:
+Writes `source-org_lfs.csv` in the current directory.
 
-```
-📊 Export Summary:
-Total repositories found: 2
-✅ Successfully processed: 23 repositories
-❌ Failed to process: 0 repositories
-🔍 Maximum search depth: 1
-🔍 Repositories with LFS: 2
-📁 Output file: mona-actions_lfs.csv
-🕐 Total time: 13s
-```
-
-## Usage: Pull
-
-Clones repositories and download their LFS objects. If the repo already exists in the `--work-dir` it will pull the latest commits and lfs objects. 
-
-```bash
-Usage:
-  migrate-lfs pull [flags]
-
-Flags:
-  -b, --branch-mode bool         Branch based approach (default false)
-  -f, --file string              Exported LFS repos file path, csv format (required)
-  -h, --help                     help for pull
-  -n, --source-hostname string   GitHub Enterprise Server hostname URL (optional)
-  -t, --source-token string      GitHub token with repo scope (required)
-  -d, --work-dir string          Working directory with cloned repositories (required)
-  -w, --workers int              Number of concurrent GIT workers to use (default 1)
-```
-
-### Example Pull Command
+### Pull
 
 ```bash
 gh migrate-lfs pull \
-  --file mona-actions_lfs.csv \
-  --work-dir ./lfs_repos \
-  --source-token ghp_xxxxxxxxxxxx \
+  --file source-org_lfs.csv \
+  --source-token "$SOURCE_TOKEN" \
+  --work-dir ./lfs-migration \
   --workers 4
 ```
 
-The pull process provides feedback:
+Creates or updates bare mirrors and downloads all source LFS objects.
 
-```
-📊 Summary:
-✅ Successfully processed: 2 repositories
-❌ Failed: 0 repositories
-📁 Output directory: lfs_repos/
-🕐 Total time: 3s
-
-✅ Pull completed successfully!
-```
-
-## Usage: Sync
-
-Push LFS content to repositories in the target organization.
-
-```bash
-Usage:
-  migrate-lfs sync [flags]
-
-Flags:
-  -b, --branch-mode bool             Branch based approach (default false)
-  -f, --file string                  Exported LFS repos file path, csv format (required)
-  -h, --help                         help for sync
-  -n, --target-hostname string       GitHub Enterprise Server hostname URL (optional)
-  -o, --target-organization string   GitHub Organization (required)
-  -t, --target-token string          GitHub token with repo scope (required)
-  -d, --work-dir string              Working directory with cloned repositories (required)
-  -w, --workers int                  Number of concurrent GIT workers to use (default 1)
-```
-
-### Example Sync Command
+### Sync
 
 ```bash
 gh migrate-lfs sync \
-  --file mona-actions_lfs.csv \
-  --target-organization mona-emu \
-  --target-token ghp_xxxxxxxxxxxx \
-  --work-dir lfs_repos/
+  --file source-org_lfs.csv \
+  --target-organization target-org \
+  --target-token "$TARGET_TOKEN" \
+  --work-dir ./lfs-migration \
+  --workers 2 \
+  --upload-parallel 16
 ```
 
-The sync process provides feedback:
+Use `gh migrate-lfs <command> --help` for the complete flag reference.
 
+## Performance Controls
+
+- `--workers`: repositories processed concurrently.
+- `--upload-parallel`: concurrent object uploads per repository.
+- `--batch-size`: OIDs per Batch API request, from 1 to 10,000.
+
+Maximum concurrent uploads are approximately `workers * upload-parallel`. The default batch size of 100 is conservative; test 1,000 or 5,000 against the destination before a large migration.
+
+## Dry Run
+
+For `sync`, `--dry-run` negotiates destination objects without uploading or writing sync state.
+
+For `migrate`, export and pull still run and write local data; only destination upload and sync-state writes are skipped.
+
+## Reports and Recovery
+
+Sync state defaults to `.lfs-migrate` and is grouped by destination:
+
+```text
+.lfs-migrate/targets/<target-id>/
+  errors-current.tsv
+  errors-history.tsv
+  last-run.json
+  sync.lock
 ```
-📊 Summary:
-✅ Successfully processed: 2 repositories
-❌ Failed: 0 repositories
-📁 Output directory: lfs_repos/
-🕐 Total time: 5s
 
-✅ Sync completed successfully!
-```
+- `errors-current.tsv`: issues from the latest run.
+- `errors-history.tsv`: append-only issue history with repository, OID, stage, and message.
+- `last-run.json`: atomic machine-readable repository results and aggregate counters.
 
-### LFS CSV Format
+Only one process may write state for a destination at a time. The operating system releases lock ownership after a crash, so a remaining `sync.lock` file does not require manual cleanup.
 
-The tool exports and imports repository information using the following CSV format:
+Interrupted runs are resumed by rerunning the same command. Source mirrors are updated, all local OIDs are rescanned, and remotely present objects are skipped.
+
+## Manifest Format
 
 ```csv
 Repository,GitAttributesPaths,CloneURL
-example-repo,.gitattributes,https://github.com/mona-actions/example-repo.git
-another-repo,.gitattributes,https://github.com/mona-actions/another-repo.git
+example-repo,.gitattributes,https://github.com/source-org/example-repo.git
+another-repo,path/to/.gitattributes,https://github.com/source-org/another-repo.git
 ```
 
-- `Repository`: The name of the repository
-- `GitAttributesPath`: Path to .gitattributes file containing LFS configurations
-- `CloneUrl`: The repository HTTPS URL
+Repository names must be unique path segments. Duplicate rows are ignored.
 
-## Required Token Permissions
+## Configuration
 
-### For Export, Pull and Sync
+The extension loads `.env` from the current directory. Precedence is:
 
-- repository contents: `repo`
-- clone: `repo`
-- git lfs pull: `repo`
-- git lfs push: `repo`
+1. Command-line flags
+2. Environment variables or `.env`
+3. Command defaults
+
+```dotenv
+GHMLFS_SOURCE_ORGANIZATION=source-org
+GHMLFS_SOURCE_HOSTNAME=
+GHMLFS_SOURCE_TOKEN=
+GHMLFS_TARGET_ORGANIZATION=target-org
+GHMLFS_TARGET_HOSTNAME=
+GHMLFS_TARGET_TOKEN=
+GHMLFS_WORK_DIR=./lfs-migration
+GHMLFS_FILE=
+GHMLFS_WORKERS=1
+GHMLFS_SEARCH_DEPTH=1
+GHMLFS_BATCH_SIZE=100
+GHMLFS_UPLOAD_PARALLEL=8
+GHMLFS_CHECK_HASHES=false
+GHMLFS_DRY_RUN=false
+GHMLFS_NO_FINAL_CHECK=false
+GHMLFS_RETRY_MAX=3
+GHMLFS_RETRY_DELAY=1s
+GHMLFS_STATE_DIR=.lfs-migrate
+```
+
+Leave `GHMLFS_FILE` blank for end-to-end discovery. Set it to use an existing manifest.
+
+For GitHub Enterprise Server, set `--source-hostname` and/or `--target-hostname` to the instance hostname.
 
 ## Proxy Support
 
-The tool supports proxy configuration through both command-line flags and environment variables:
-
-### Command-line flags:
-```bash
-Global Flags:
-      --http-proxy string    HTTP proxy (can also use HTTP_PROXY env var)
-      --https-proxy string   HTTPS proxy (can also use HTTPS_PROXY env var)
-      --no-proxy string      No proxy list (can also use NO_PROXY env var)
-```
-
-Example usage with proxy:
-
-```bash
-gh migrate-lfs pull \
-  --file mona-actions_lfs.csv \
-  --work-dir ./lfs_repos \
-  --source-token ghp_xxxxxxxxxxxx \
-  --https-proxy https://proxy.example.com:8080
-```
-Example with environment variables:
+Standard proxy variables are supported:
 
 ```bash
 export HTTPS_PROXY=https://proxy.example.com:8080
-export NO_PROXY=github.internal.com
-export GHMLFS_TARGET_TOKEN=ghp_...
+export NO_PROXY=github.internal.example
 ```
+
+Equivalent flags are `--http-proxy`, `--https-proxy`, and `--no-proxy`.
+
+## Safety
+
+- Tokens are sent in authorization headers and are not embedded in clone URLs.
+- Upload credentials are not forwarded to different storage hosts.
+- HTTPS is required except for localhost testing.
+- Pull failure prevents sync in the end-to-end workflow.
+- Run summaries and logs use restricted file permissions.
+
+## Development Checks
 
 ```bash
-gh migrate-lfs export \
-    --source-organization mona-actions
+go test -race ./...
+go vet ./...
+staticcheck ./...
+dupl -plumbing -t 100 .
 ```
 
-## Using a `.env` file (recommended)
-
-The tool supports loading configuration from a `.env` file. This provides an alternative to command-line flags and allows you to store your configuration securely.
-
-### Using a .env file
-
-1. Create a `.env` file in your working directory:
-
-```bash
-GHMLFS_BRANCH_MODE=false                 # Branch based Approach
-GHMLFS_SOURCE_ORGANIZATION=mona-actions  # Source organization name
-GHMLFS_SOURCE_HOSTNAME=                  # Source hostname
-GHMLFS_SOURCE_TOKEN=ghp_xxx              # Source token
-GHMLFS_TARGET_ORGANIZATION=mona-emu      # Target organization name
-GHMLFS_TARGET_HOSTNAME=                  # Target hostname
-GHMLFS_TARGET_TOKEN=ghp_yyy              # Target token
-GHMLFS_WORKERS=1                         # worker count
-GHMLFS_WORK_DIR=                         # work directory
-GHMLFS_FILE=${GHMLFS_SOURCE_ORGANIZATION}_lfs.csv # Input CSV file name
-```
-
-2. Run the commands without flags - the tool will automatically load values from the .env file:
-
-```bash
-gh migrate-lfs export
-```
-```bash
-gh migrate-lfs pull
-```
-```bash
-gh migrate-lfs sync
-```
-
-When both environment variables and command-line flags are provided, the command-line flags take precedence. This allows you to override specific values while still using the .env file for most configuration.
-
-### Example with Mixed Usage
-
-```bash
-# Load most values from .env but override the target organization
-gh migrate-lfs sync --target-organization different-org
-```
-
-## Retry Configuration
-
-The tool includes configurable retry behavior for API calls:
-
-```bash
-Global Flags:
-    --retry-delay string   Delay between retries (default "1s")
-    --retry-max int        Maximum retry attempts (default 3)
-```
-
-Example usage with retry configuration:
-
-```bash
-gh migrate-lfs export \
-    --retry-max 5 \
-    --retry-delay 2s
-```
-
-This configuration allows you to:
-- Adjust the number of retry attempts for failed API calls
-- Modify the delay between retry attempts
-- Handle temporary API issues or rate limiting more gracefully
-
-
-## Limitations
-
-- Requires `git-lfs` to be installed
-- Target repositories must exist in the destination organization before syncing
-- Large LFS repositories will take significant time to download and upload
-- Network bandwidth and storage space should be considered when migrating large LFS repositories
-- The tool will retry failed operations but may still encounter persistent access or network issues
-- Deep directory structures may require adjusting the search depth parameter 
-- Workers operate on a per repository basis and are not recommended for large repositories
-- Too many workers can result in ratelimiting. 
+Go rejects unused imports and local variables during compilation. `staticcheck` detects unused private declarations and broader static issues. `dupl` reports structurally duplicated code; CI fails when it finds a clone group of at least 100 tokens.
 
 ## License
 
-- [MIT](./license) (c) [Mona-Actions](https://github.com/mona-actions)
-- [Contributing](./contributing.md)
+[MIT](LICENSE) © [Mona Actions](https://github.com/mona-actions)

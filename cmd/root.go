@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/spf13/cobra"
@@ -8,13 +9,19 @@ import (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "migrate-lfs",
-	Short: "gh cli extension to migrate LFS files between git repositories",
-	Long:  "gh cli extension to migrate LFS files between git repositories",
+	Use:          "migrate-lfs",
+	Short:        "gh cli extension to migrate LFS files between git repositories",
+	Long:         "gh cli extension to migrate LFS files between git repositories",
+	SilenceUsage: true,
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		return configErr
+	},
 }
 
-func Execute() error {
-	return rootCmd.Execute()
+var configErr error
+
+func ExecuteContext(ctx context.Context) error {
+	return rootCmd.ExecuteContext(ctx)
 }
 
 func init() {
@@ -31,11 +38,12 @@ func init() {
 	viper.BindPFlag("HTTP_PROXY", rootCmd.PersistentFlags().Lookup("http-proxy"))
 	viper.BindPFlag("HTTPS_PROXY", rootCmd.PersistentFlags().Lookup("https-proxy"))
 	viper.BindPFlag("NO_PROXY", rootCmd.PersistentFlags().Lookup("no-proxy"))
-	viper.BindPFlag("RETRY_MAX", rootCmd.PersistentFlags().Lookup("retry-max"))
-	viper.BindPFlag("RETRY_DELAY", rootCmd.PersistentFlags().Lookup("retry-delay"))
+	viper.BindPFlag("GHMLFS_RETRY_MAX", rootCmd.PersistentFlags().Lookup("retry-max"))
+	viper.BindPFlag("GHMLFS_RETRY_DELAY", rootCmd.PersistentFlags().Lookup("retry-delay"))
 
 	// Add subcommands
 	rootCmd.AddCommand(exportCmd)
+	rootCmd.AddCommand(migrateCmd)
 	rootCmd.AddCommand(pullCmd)
 	rootCmd.AddCommand(syncCmd)
 
@@ -45,18 +53,14 @@ func init() {
 }
 
 func initConfig() {
-	// Allow .env file
 	viper.SetConfigType("env")
 	viper.AddConfigPath(".")
 	viper.SetConfigName(".env")
 
-	// Read config file
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-			fmt.Printf("Error reading config file: %v\n", err)
+			configErr = fmt.Errorf("read configuration: %w", err)
 		}
 	}
-
-	// Read from environment
 	viper.AutomaticEnv()
 }

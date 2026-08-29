@@ -1,223 +1,250 @@
 package sync
 
 import (
-    "bufio"
-    "encoding/csv"
-    "fmt"
-    "os"
-    "os/exec"
-    "path/filepath"
-    "strings"
+	"context"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"sync"
+	"time"
 
-    "github.com/mona-actions/gh-migrate-lfs/pkg/common"
-    "github.com/spf13/viper"
+	"github.com/mona-actions/gh-migrate-lfs/internal/manifest"
+	"github.com/mona-actions/gh-migrate-lfs/internal/worker"
+	"github.com/mona-actions/gh-migrate-lfs/pkg/lfs"
 )
 
-type syncJob struct {
-    repoName  string
-    workDir   string
-    targetOrg string
+type Config struct {
+	InputFile      string
+	WorkDir        string
+	TargetOrg      string
+	TargetHostname string
+	Token          string
+	Workers        int
+	BatchSize      int
+	UploadParallel int
+	RetryMax       int
+	RetryDelay     time.Duration
+	CheckHashes    bool
+	DryRun         bool
+	FinalCheck     bool
+	StateRoot      string
 }
 
-func SyncFromCSV() error {
-    inputFile := viper.GetString("GHMLFS_FILE")
-    workDir := viper.GetString("GHMLFS_WORK_DIR")
-    targetOrg := viper.GetString("GHMLFS_TARGET_ORGANIZATION")
-    token := viper.GetString("GHMLFS_TARGET_TOKEN")
-    maxWorkers := viper.GetInt("GHMLFS_WORKERS")
-    branchMode := viper.GetBool("GHMLFS_BRANCH_MODE")
+type repositoryConfig struct {
+	Name           string
+	Path           string
+	TargetOrg      string
+	TargetHostname string
+	Token          string
+	BatchSize      int
+	Parallel       int
+	RetryMax       int
+	RetryDelay     time.Duration
+	CheckHashes    bool
+	DryRun         bool
+	FinalCheck     bool
+	Reporter       lfs.IssueReporter
+}
 
-	// Ensure at least 1 worker
-	if maxWorkers <= 0 {
-		maxWorkers = 1
+var progressMu sync.Mutex
+
+func Run(ctx context.Context, cfg Config) error {
+	repositories, err := manifest.Load(cfg.InputFile)
+	if err != nil {
+		return err
+	}
+	reporter, err := newRunReporter(cfg.StateRoot, cfg.TargetHostname, cfg.TargetOrg, cfg.DryRun)
+	if err != nil {
+		return err
 	}
 
-    // Read CSV file
-    file, err := os.Open(inputFile)
-    if err != nil {
-        return fmt.Errorf("error opening input file: %w", err)
-    }
-    defer file.Close()
+	jobChannel := make(chan manifest.Repository, len(repositories))
+	for _, repository := range repositories {
+		jobChannel <- repository
+	}
+	close(jobChannel)
 
-    reader := csv.NewReader(file)
-    // Skip header
-    if _, err := reader.Read(); err != nil {
-        return fmt.Errorf("error reading CSV header: %w", err)
-    }
+	stats := worker.NewStats()
+	err = worker.Run(ctx, jobChannel, max(cfg.Workers, 1), stats, func(repository manifest.Repository) error {
+		startedAt := time.Now()
+		repositoryStats, repositoryErr := syncRepository(ctx, repositoryConfig{
+			Name:           repository.Name,
+			Path:           filepath.Join(cfg.WorkDir, repository.Name),
+			TargetOrg:      cfg.TargetOrg,
+			TargetHostname: cfg.TargetHostname,
+			Token:          cfg.Token,
+			BatchSize:      cfg.BatchSize,
+			Parallel:       cfg.UploadParallel,
+			RetryMax:       cfg.RetryMax,
+			RetryDelay:     cfg.RetryDelay,
+			CheckHashes:    cfg.CheckHashes,
+			DryRun:         cfg.DryRun,
+			FinalCheck:     cfg.FinalCheck,
+			Reporter:       reporter.forRepository(repository.Name),
+		})
+		result := repositoryResult{
+			Repository: repository.Name,
+			Duration:   time.Since(startedAt).Round(time.Millisecond).String(),
+			Stats:      repositoryStats,
+			Complete:   repositoryErr == nil,
+		}
+		if repositoryErr != nil {
+			result.Error = repositoryErr.Error()
+		}
+		reporter.record(result)
+		return repositoryErr
+	})
+	stats.PrintSummary(cfg.WorkDir)
+	summary, reportErr := reporter.finish(cfg.TargetHostname, cfg.TargetOrg)
+	printRunSummary(summary, reporter.stateDir)
+	if err := errors.Join(err, reportErr); err != nil {
+		return err
+	}
 
-    // Create jobs channel and track unique repositories
-    jobs := make(chan syncJob)
-    seen := make(map[string]bool)
-
-    // Start goroutine to send jobs
-    go func() {
-        defer close(jobs)
-        for {
-            record, err := reader.Read()
-            if err != nil {
-                break
-            }
-            repoName := record[0]
-            if seen[repoName] {
-                continue
-            }
-            seen[repoName] = true
-
-            jobs <- syncJob{
-                repoName:  repoName,
-                workDir:   workDir,
-                targetOrg: targetOrg,
-            }
-        }
-    }()
-
-    // Create and run worker pool
-    stats := common.NewProcessStats()
-    err = common.WorkerPool(jobs, maxWorkers, stats, func(job syncJob) error {
-        if branchMode {
-            return SyncLFSContentBranchMode(job.repoName, job.workDir, job.targetOrg, token)
-        }
-        return SyncLFSContentMirrorMode(job.repoName, job.workDir, job.targetOrg, token)
-    })
-
-    // Print summary
-    stats.PrintSummary(workDir)
-
-    if err != nil {
-        return err
-    }
-
-    fmt.Println("\n✅ Sync completed successfully!")
-    return nil
+	fmt.Println("\nSync completed successfully!")
+	return nil
 }
 
-func SyncLFSContentMirrorMode(repoName, workDir, targetOrg, token string) error {
-    repoPath := filepath.Join(workDir, repoName)
+func syncRepository(ctx context.Context, cfg repositoryConfig) (lfs.Stats, error) {
+	if err := ctx.Err(); err != nil {
+		reportIssue(cfg.Reporter, "context", err)
+		return lfs.Stats{}, err
+	}
 
-    env := os.Environ()
-    env = append(env, fmt.Sprintf("GITHUB_TOKEN=%s", token))
-    env = append(env, "GIT_TERMINAL_PROMPT=0")
+	endpoint, err := lfs.EndpointURL(cfg.TargetHostname, cfg.TargetOrg, cfg.Name)
+	if err != nil {
+		reportIssue(cfg.Reporter, "configuration", err)
+		return lfs.Stats{}, fmt.Errorf("%s: %w", cfg.Name, err)
+	}
+	uploader, err := lfs.NewUploader(lfs.Config{
+		Endpoint:   endpoint,
+		Token:      cfg.Token,
+		BatchSize:  cfg.BatchSize,
+		Parallel:   cfg.Parallel,
+		RetryMax:   cfg.RetryMax,
+		RetryDelay: cfg.RetryDelay,
+		Reporter:   cfg.Reporter,
+	})
+	if err != nil {
+		reportIssue(cfg.Reporter, "configuration", err)
+		return lfs.Stats{}, fmt.Errorf("%s: configure uploader: %w", cfg.Name, err)
+	}
 
-    fmt.Printf("Syncing %s to %s/%s...\n", repoName, targetOrg, repoName)
+	var repositoryStats lfs.Stats
+	var firstOperationError error
+	failedOperations := 0
+	lastProgress := time.Now()
+	printProgress("%s: scanning and syncing local LFS objects\n", cfg.Name)
+	totalObjects, err := lfs.WalkObjectBatches(ctx, cfg.Path, cfg.BatchSize, func(objects []lfs.Object) error {
+		repositoryStats.Objects += len(objects)
+		objectsToUpload := objects
+		if cfg.CheckHashes {
+			verified, verifyErr := lfs.VerifyObjects(ctx, objects, cfg.Parallel, cfg.Reporter)
+			objectsToUpload = verified
+			if verifyErr != nil {
+				failedOperations++
+				if firstOperationError == nil {
+					firstOperationError = fmt.Errorf("local object verification failed: %w", verifyErr)
+				}
+			}
+		}
+		if len(objectsToUpload) == 0 {
+			return nil
+		}
 
-    baseURL := fmt.Sprintf("https://x-access-token:%s@github.com/%s/%s.git", token, targetOrg, repoName)
+		batchStats, uploadErr := uploader.Upload(ctx, objectsToUpload, cfg.DryRun)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		batchStats.Objects = 0
+		if !cfg.DryRun && cfg.FinalCheck {
+			reconcileStats, reconcileErr := uploader.Reconcile(ctx, objectsToUpload)
+			batchStats.RemotePresent = reconcileStats.RemotePresent
+			batchStats.RemoteMissing = reconcileStats.RemoteMissing
+			batchStats.RemoteErrors = reconcileStats.RemoteErrors
+			if reconcileErr != nil {
+				failedOperations++
+				if firstOperationError == nil {
+					firstOperationError = fmt.Errorf("final reconciliation failed: %w", reconcileErr)
+				}
+			}
+		}
+		repositoryStats.Add(batchStats)
+		if uploadErr != nil {
+			failedOperations++
+			if firstOperationError == nil {
+				firstOperationError = fmt.Errorf("direct LFS upload failed: %w", uploadErr)
+			}
+		}
+		if time.Since(lastProgress) >= 5*time.Second {
+			printProgress("%s: processed %d objects (%d uploaded, %d already present, %d failures)\n",
+				cfg.Name,
+				repositoryStats.Objects,
+				repositoryStats.Uploaded,
+				repositoryStats.AlreadyPresent,
+				repositoryStats.UploadFailures+repositoryStats.ServerErrors+repositoryStats.BatchFailures+repositoryStats.Unexpected,
+			)
+			lastProgress = time.Now()
+		}
+		return nil
+	})
+	if err != nil {
+		stage := "local-scan"
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			stage = "context"
+		}
+		reportIssue(cfg.Reporter, stage, err)
+		return repositoryStats, fmt.Errorf("%s: %w", cfg.Name, err)
+	}
+	if totalObjects == 0 {
+		printProgress("%s: no local LFS objects\n", cfg.Name)
+		return repositoryStats, nil
+	}
 
-    remoteCmd := exec.Command("git", "remote", "set-url", "origin", baseURL)
-    remoteCmd.Dir = repoPath
-    if err := remoteCmd.Run(); err != nil {
-        return fmt.Errorf("failed to set remote url: %w", err)
-    }
-
-    // Push all LFS content
-    lfsPushCmd := exec.Command("git", "lfs", "push", "--all", "origin")
-    lfsPushCmd.Dir = repoPath
-    lfsPushCmd.Env = env
-    if output, err := lfsPushCmd.CombinedOutput(); err != nil {
-        errMsg := strings.ReplaceAll(string(output), token, "****")
-        return fmt.Errorf("failed to push LFS content: %s, %w", errMsg, err)
-    }
-
-    fmt.Printf("Successfully synced content for %s\n", repoName)
-    return nil
+	if cfg.DryRun {
+		printProgress("%s: dry run: %d would upload, %d already present, %d server errors, %d unexpected replies\n",
+			cfg.Name, repositoryStats.WouldUpload, repositoryStats.AlreadyPresent, repositoryStats.ServerErrors, repositoryStats.Unexpected)
+	} else {
+		printProgress("%s: %d uploaded, %d already present, %d upload failures, %d server errors\n",
+			cfg.Name, repositoryStats.Uploaded, repositoryStats.AlreadyPresent, repositoryStats.UploadFailures, repositoryStats.ServerErrors)
+	}
+	if firstOperationError != nil {
+		return repositoryStats, fmt.Errorf("%d operations failed; first failure: %w", failedOperations, firstOperationError)
+	}
+	return repositoryStats, nil
 }
 
-func SyncLFSContentBranchMode(repoName, workDir, targetOrg, token string) error {
-    repoPath := filepath.Join(workDir, repoName)
-
-    env := os.Environ()
-    env = append(env, fmt.Sprintf("GITHUB_TOKEN=%s", token))
-    env = append(env, "GIT_TERMINAL_PROMPT=0")
-
-    fmt.Printf("Syncing %s to %s/%s...\n", repoName, targetOrg, repoName)
-
-    baseURL := fmt.Sprintf("https://x-access-token:%s@github.com/%s/%s.git", token, targetOrg, repoName)
-
-    remoteCmd := exec.Command("git", "remote", "set-url", "origin", baseURL)
-    remoteCmd.Dir = repoPath
-    if err := remoteCmd.Run(); err != nil {
-        return fmt.Errorf("failed to set remote url: %w", err)
-    }
-
-    // Get the default branch using symbolic-ref
-    defaultBranchCmd := exec.Command("git", "symbolic-ref", "refs/remotes/origin/HEAD")
-    defaultBranchCmd.Dir = repoPath
-    output, err := defaultBranchCmd.Output()
-    if err != nil {
-        return fmt.Errorf("failed to get default branch: %w", err)
-    }
-    defaultBranch := strings.TrimPrefix(
-        strings.TrimSpace(string(output)),
-        "refs/remotes/origin/",
-    )
-
-    // Get list of all remote branches
-    branchCmd := exec.Command("git", "for-each-ref", "--format=%(refname)", "refs/remotes/origin")
-    branchCmd.Dir = repoPath
-    output, err = branchCmd.Output()
-    if err != nil {
-        return fmt.Errorf("failed to list branches: %w", err)
-    }
-
-    // Process branches, starting with default branch
-    branches := []string{}
-    scanner := bufio.NewScanner(strings.NewReader(string(output)))
-    for scanner.Scan() {
-        branch := scanner.Text()
-        if strings.HasSuffix(branch, "/HEAD") {
-            continue
-        }
-        branchName := strings.TrimPrefix(branch, "refs/remotes/origin/")
-        if branchName != defaultBranch {
-            branches = append(branches, branchName)
-        }
-    }
-
-    // Process default branch first
-    if err := processBranch(repoPath, defaultBranch, env, token); err != nil {
-        return err
-    }
-
-    // Process remaining branches
-    for _, branchName := range branches {
-        if err := processBranch(repoPath, branchName, env, token); err != nil {
-            return err
-        }
-    }
-
-    return nil
+func printProgress(format string, args ...any) {
+	progressMu.Lock()
+	fmt.Printf(format, args...)
+	progressMu.Unlock()
 }
 
-// Helper function to process a single branch
-func processBranch(repoPath, branchName string, env []string, token string) error {
-    // Checkout branch
-    checkoutCmd := exec.Command("git", "checkout", branchName)
-    checkoutCmd.Dir = repoPath
-    if output, err := checkoutCmd.CombinedOutput(); err != nil {
-        return fmt.Errorf("failed to checkout branch %s: %s, %w", branchName, string(output), err)
-    }
+func reportIssue(reporter lfs.IssueReporter, stage string, err error) {
+	if reporter != nil {
+		reporter.ReportIssue(lfs.Issue{Stage: stage, Message: err.Error()})
+	}
+}
 
-    // Reset and clean
-    resetCmd := exec.Command("git", "reset", "--hard")
-    resetCmd.Dir = repoPath
-    if output, err := resetCmd.CombinedOutput(); err != nil {
-        return fmt.Errorf("failed to reset branch %s: %s, %w", branchName, string(output), err)
-    }
-
-    cleanCmd := exec.Command("git", "clean", "-f", "-d")
-    cleanCmd.Dir = repoPath
-    if output, err := cleanCmd.CombinedOutput(); err != nil {
-        return fmt.Errorf("failed to clean branch %s: %s, %w", branchName, string(output), err)
-    }
-
-    // Push LFS content for this branch
-    lfsPushCmd := exec.Command("git", "lfs", "push", "origin", branchName, "--all")
-    lfsPushCmd.Dir = repoPath
-    lfsPushCmd.Env = env
-    if output, err := lfsPushCmd.CombinedOutput(); err != nil {
-        errMsg := strings.ReplaceAll(string(output), token, "****")
-        return fmt.Errorf("failed to push LFS content for branch %s: %s, %w", branchName, errMsg, err)
-    }
-
-    fmt.Printf("Successfully synced content for branch %s\n", branchName)
-    return nil
+func printRunSummary(summary runSummary, stateDir string) {
+	fmt.Println("\nLFS object summary:")
+	fmt.Printf("local objects:       %d\n", summary.Stats.Objects)
+	if summary.DryRun {
+		fmt.Printf("would upload:        %d\n", summary.Stats.WouldUpload)
+	} else {
+		fmt.Printf("uploaded:            %d\n", summary.Stats.Uploaded)
+	}
+	fmt.Printf("already present:     %d\n", summary.Stats.AlreadyPresent)
+	fmt.Printf("server errors:       %d\n", summary.Stats.ServerErrors)
+	fmt.Printf("upload failures:     %d\n", summary.Stats.UploadFailures)
+	fmt.Printf("batch failures:      %d\n", summary.Stats.BatchFailures)
+	fmt.Printf("unexpected replies:  %d\n", summary.Stats.Unexpected)
+	if !summary.DryRun {
+		fmt.Printf("remote present:      %d\n", summary.Stats.RemotePresent)
+		fmt.Printf("remote missing:      %d\n", summary.Stats.RemoteMissing)
+		fmt.Printf("remote errors:       %d\n", summary.Stats.RemoteErrors)
+		fmt.Printf("current errors:      %s\n", filepath.Join(stateDir, "errors-current.tsv"))
+		fmt.Printf("error history:       %s\n", filepath.Join(stateDir, "errors-history.tsv"))
+		fmt.Printf("last run:            %s\n", filepath.Join(stateDir, "last-run.json"))
+	}
 }

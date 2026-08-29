@@ -1,127 +1,128 @@
 package export
 
 import (
+	"context"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/mona-actions/gh-migrate-lfs/internal/api"
 	"github.com/pterm/pterm"
-	"github.com/spf13/viper"
 )
 
-// RepoLFSInfo holds information about a repository containing LFS data
-type RepoLFSInfo struct {
-	Name     string
-	Path     string
-	CloneURL string
+type Config struct {
+	Organization string
+	Token        string
+	Hostname     string
+	Depth        int
+	OutputFile   string
 }
 
-func ExportLFSRepos() error {
+type repositoryInfo struct {
+	Name              string
+	GitAttributesPath string
+	CloneURL          string
+}
+
+func Run(ctx context.Context, cfg Config) error {
 	start := time.Now()
-	spinner, _ := pterm.DefaultSpinner.Start("Searching for repositories with LFS content...")
-
-	// Get configuration
-	organization := viper.GetString("GHMLFS_SOURCE_ORGANIZATION")
-	token := viper.GetString("GHMLFS_SOURCE_TOKEN")
-	depth := viper.GetInt("GHMLFS_SEARCH_DEPTH")
-	hostname := viper.GetString("GHMLFS_SOURCE_HOSTNAME")
-
-	if organization == "" || token == "" {
-		return fmt.Errorf("missing required parameters: organization, token")
+	if cfg.Organization == "" || cfg.Organization == "." || cfg.Organization == ".." || strings.ContainsAny(cfg.Organization, "/\\") {
+		return errors.New("organization must be one path segment")
+	}
+	if cfg.Depth < 1 {
+		cfg.Depth = 1
+	}
+	if cfg.OutputFile == "" {
+		cfg.OutputFile = cfg.Organization + "_lfs.csv"
 	}
 
-	if depth == 0 {
-		depth = 1 // Default depth if not specified
-	}
-
-	// Fetch repositories
-	pterm.Info.Printf("Fetching repository list for %s...", organization)
-	repos, err := api.GetRepositories(organization, token, hostname)
+	pterm.Info.Printf("Fetching repository list for %s...\n", cfg.Organization)
+	repositories, err := api.ListRepositories(ctx, cfg.Organization, cfg.Token, cfg.Hostname)
 	if err != nil {
-		return fmt.Errorf("failed to fetch repositories: %w", err)
+		return fmt.Errorf("fetch repositories: %w", err)
 	}
-	pterm.Info.Printf("Found %d repositories\n", len(repos))
+	pterm.Info.Printf("Found %d repositories\n", len(repositories))
 
-	// Process repositories and collect LFS information
-	var lfsRepos []RepoLFSInfo
-	var successful, failed, found int
-
-	pterm.Info.Printf("Checking repositories for LFS content (searching up to depth %d)...", depth)
-
-	for _, repo := range repos {
-		pterm.Info.Printf("Searching repository contents: '%s'...\n", repo)
-
-		hasLFS, path, err := api.CheckGitAttributes(organization, repo, token, depth, hostname)
+	var lfsRepositories []repositoryInfo
+	var repositoryErrors []error
+	for _, repository := range repositories {
+		pterm.Info.Printf("Searching repository contents: '%s'...\n", repository)
+		hasLFS, path, err := api.FindLFSAttributes(ctx, cfg.Organization, repository, cfg.Token, cfg.Depth, cfg.Hostname)
 		if err != nil {
-			pterm.Info.Printf("Warning: Failed to determine LFS status for repo %s: %v", repo, err)
-			failed++
+			repositoryErrors = append(repositoryErrors, fmt.Errorf("%s: %w", repository, err))
+			continue
+		}
+		if !hasLFS {
 			continue
 		}
 
-		if hasLFS {
-			cloneURL := fmt.Sprintf("https://github.com/%s/%s.git", organization, repo)
-			if hostname != "" {
-				cloneURL = fmt.Sprintf("%s/%s/%s.git", hostname, organization, repo)
-			}
-
-			lfsRepos = append(lfsRepos, RepoLFSInfo{
-				Name:     repo,
-				Path:     path,
-				CloneURL: cloneURL,
-			})
-			found++
-			pterm.Success.Printf("LFS filter matched for repository '%s' (path: %s)\n", repo, path)
+		cloneURL, err := api.RepositoryCloneURL(cfg.Hostname, cfg.Organization, repository)
+		if err != nil {
+			return fmt.Errorf("build clone URL for %s: %w", repository, err)
 		}
-
-		successful++
+		lfsRepositories = append(lfsRepositories, repositoryInfo{Name: repository, GitAttributesPath: path, CloneURL: cloneURL})
+		pterm.Success.Printf("LFS filter matched for repository '%s' (path: %s)\n", repository, path)
 	}
 
-	// Write results to CSV file
-	outputFile := viper.GetString("GHMLFS_SOURCE_ORGANIZATION") + "_lfs.csv"
-	if err := writeToCSV(outputFile, lfsRepos); err != nil {
-		return fmt.Errorf("failed to write CSV file: %w", err)
+	if err := writeToCSV(cfg.OutputFile, lfsRepositories); err != nil {
+		return fmt.Errorf("write CSV file: %w", err)
 	}
-	spinner.Success()
-
-	fmt.Printf("\n📊 Export Summary:\n")
-	fmt.Printf("Total repositories found: %d\n", len(repos))
-	fmt.Printf("✅ Successfully processed: %d repositories\n", successful)
-	fmt.Printf("❌ Failed to process: %d repositories\n", failed)
-	fmt.Printf("🔍 Maximum search depth: %d\n", depth)
-	fmt.Printf("🔍 Repositories with LFS: %d\n", found)
-	fmt.Printf("📁 Output file: %s\n", outputFile)
-	fmt.Printf("🕐 Total time: %v\n", time.Since(start).Round(time.Second))
-
+	printSummary(start, cfg, len(repositories), len(repositoryErrors), len(lfsRepositories))
+	if len(repositoryErrors) > 0 {
+		return fmt.Errorf("failed to inspect %d repositories: %w", len(repositoryErrors), errors.Join(repositoryErrors...))
+	}
 	return nil
 }
 
-func writeToCSV(filename string, repos []RepoLFSInfo) error {
-	file, err := os.Create(filename)
+func printSummary(start time.Time, cfg Config, total, failed, found int) {
+	fmt.Printf("\nExport Summary:\n")
+	fmt.Printf("Total repositories found: %d\n", total)
+	fmt.Printf("Successfully processed: %d repositories\n", total-failed)
+	fmt.Printf("Failed to process: %d repositories\n", failed)
+	fmt.Printf("Maximum search depth: %d\n", cfg.Depth)
+	fmt.Printf("Repositories with LFS: %d\n", found)
+	fmt.Printf("Output file: %s\n", cfg.OutputFile)
+	fmt.Printf("Total time: %v\n", time.Since(start).Round(time.Second))
+}
+
+func writeToCSV(filename string, repositories []repositoryInfo) error {
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
-		return fmt.Errorf("error creating output file: %w", err)
+		return fmt.Errorf("create output file: %w", err)
 	}
-	defer file.Close()
+	if err := file.Chmod(0o600); err != nil {
+		file.Close()
+		return fmt.Errorf("set output file permissions: %w", err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = file.Close()
+		}
+	}()
 
 	writer := csv.NewWriter(file)
-	defer writer.Flush()
-
-	// Write header
 	if err := writer.Write([]string{"Repository", "GitAttributesPaths", "CloneURL"}); err != nil {
-		return fmt.Errorf("error writing header: %w", err)
+		return fmt.Errorf("write header: %w", err)
 	}
-
-	// Write data
-	for _, repo := range repos {
-		if err := writer.Write([]string{
-			repo.Name,
-			repo.Path,
-			repo.CloneURL,
-		}); err != nil {
-			return fmt.Errorf("error writing repository data: %w", err)
+	for _, repository := range repositories {
+		if err := writer.Write([]string{repository.Name, repository.GitAttributesPath, repository.CloneURL}); err != nil {
+			return fmt.Errorf("write repository data: %w", err)
 		}
 	}
-
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return fmt.Errorf("flush CSV data: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync CSV file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close CSV file: %w", err)
+	}
+	closed = true
 	return nil
 }
