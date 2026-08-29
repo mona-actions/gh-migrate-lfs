@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/mona-actions/gh-migrate-lfs/internal/api"
-	"github.com/pterm/pterm"
+	"github.com/mona-actions/gh-migrate-lfs/internal/output"
 )
 
 type Config struct {
@@ -19,12 +19,24 @@ type Config struct {
 	Hostname     string
 	Depth        int
 	OutputFile   string
+	Output       *output.Renderer
 }
 
 type repositoryInfo struct {
 	Name              string
 	GitAttributesPath string
 	CloneURL          string
+}
+
+type Summary struct {
+	Complete              bool   `json:"complete"`
+	RepositoriesInspected int    `json:"repositories_inspected"`
+	RepositoriesProcessed int    `json:"repositories_processed"`
+	RepositoriesFailed    int    `json:"repositories_failed"`
+	RepositoriesUsingLFS  int    `json:"repositories_using_lfs"`
+	MaximumSearchDepth    int    `json:"maximum_search_depth"`
+	Duration              string `json:"duration"`
+	Manifest              string `json:"manifest"`
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -39,20 +51,21 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg.OutputFile = cfg.Organization + "_lfs.csv"
 	}
 
-	pterm.Info.Printf("Fetching repository list for %s...\n", cfg.Organization)
-	repositories, err := api.ListRepositories(ctx, cfg.Organization, cfg.Token, cfg.Hostname)
+	cfg.Output.Line("Finding Git LFS repositories in %s", cfg.Organization)
+	cfg.Output.Status("Fetching repository list")
+	repositories, err := api.ListRepositories(ctx, cfg.Organization, cfg.Token, cfg.Hostname, cfg.Output)
 	if err != nil {
 		return fmt.Errorf("fetch repositories: %w", err)
 	}
-	pterm.Info.Printf("Found %d repositories\n", len(repositories))
 
 	var lfsRepositories []repositoryInfo
 	var repositoryErrors []error
-	for _, repository := range repositories {
-		pterm.Info.Printf("Searching repository contents: '%s'...\n", repository)
-		hasLFS, path, err := api.FindLFSAttributes(ctx, cfg.Organization, repository, cfg.Token, cfg.Depth, cfg.Hostname)
+	for index, repository := range repositories {
+		cfg.Output.Status("Searching repositories %d/%d | %d use LFS", index, len(repositories), len(lfsRepositories))
+		hasLFS, path, err := api.FindLFSAttributes(ctx, cfg.Organization, repository, cfg.Token, cfg.Depth, cfg.Hostname, cfg.Output)
 		if err != nil {
 			repositoryErrors = append(repositoryErrors, fmt.Errorf("%s: %w", repository, err))
+			cfg.Output.Line("Failed %s: %v", repository, err)
 			continue
 		}
 		if !hasLFS {
@@ -64,28 +77,47 @@ func Run(ctx context.Context, cfg Config) error {
 			return fmt.Errorf("build clone URL for %s: %w", repository, err)
 		}
 		lfsRepositories = append(lfsRepositories, repositoryInfo{Name: repository, GitAttributesPath: path, CloneURL: cloneURL})
-		pterm.Success.Printf("LFS filter matched for repository '%s' (path: %s)\n", repository, path)
+		cfg.Output.Line("Found %s  %s", repository, path)
 	}
+	cfg.Output.FinishStatus("Searched %d/%d repositories | %d use LFS", len(repositories), len(repositories), len(lfsRepositories))
 
 	if err := writeToCSV(cfg.OutputFile, lfsRepositories); err != nil {
 		return fmt.Errorf("write CSV file: %w", err)
 	}
-	printSummary(start, cfg, len(repositories), len(repositoryErrors), len(lfsRepositories))
-	if len(repositoryErrors) > 0 {
-		return fmt.Errorf("failed to inspect %d repositories: %w", len(repositoryErrors), errors.Join(repositoryErrors...))
+	summary := Summary{
+		Complete:              len(repositoryErrors) == 0,
+		RepositoriesInspected: len(repositories),
+		RepositoriesProcessed: len(repositories) - len(repositoryErrors),
+		RepositoriesFailed:    len(repositoryErrors),
+		RepositoriesUsingLFS:  len(lfsRepositories),
+		MaximumSearchDepth:    cfg.Depth,
+		Duration:              time.Since(start).Round(time.Second).String(),
+		Manifest:              cfg.OutputFile,
 	}
-	return nil
+	cfg.Output.Record("export", summary)
+	printSummary(cfg.Output, summary)
+	if len(repositoryErrors) > 0 {
+		return errors.Join(
+			fmt.Errorf("failed to inspect %d repositories: %w", len(repositoryErrors), errors.Join(repositoryErrors...)),
+			cfg.Output.Err(),
+		)
+	}
+	return cfg.Output.Err()
 }
 
-func printSummary(start time.Time, cfg Config, total, failed, found int) {
-	fmt.Printf("\nExport Summary:\n")
-	fmt.Printf("Total repositories found: %d\n", total)
-	fmt.Printf("Successfully processed: %d repositories\n", total-failed)
-	fmt.Printf("Failed to process: %d repositories\n", failed)
-	fmt.Printf("Maximum search depth: %d\n", cfg.Depth)
-	fmt.Printf("Repositories with LFS: %d\n", found)
-	fmt.Printf("Output file: %s\n", cfg.OutputFile)
-	fmt.Printf("Total time: %v\n", time.Since(start).Round(time.Second))
+func printSummary(renderer *output.Renderer, summary Summary) {
+	status := "complete"
+	if !summary.Complete {
+		status = "incomplete"
+	}
+	renderer.Result("\nExport %s\n\n", status)
+	renderer.Result("Repositories inspected:  %d\n", summary.RepositoriesInspected)
+	renderer.Result("Successfully processed:  %d\n", summary.RepositoriesProcessed)
+	renderer.Result("Failed to inspect:       %d\n", summary.RepositoriesFailed)
+	renderer.Result("Repositories using LFS: %d\n", summary.RepositoriesUsingLFS)
+	renderer.Result("Maximum search depth:    %d\n", summary.MaximumSearchDepth)
+	renderer.Result("Duration:                %s\n", summary.Duration)
+	renderer.Result("Manifest:                %s\n", summary.Manifest)
 }
 
 func writeToCSV(filename string, repositories []repositoryInfo) error {

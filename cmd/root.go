@@ -33,6 +33,9 @@ func init() {
 	rootCmd.PersistentFlags().String("no-proxy", "", "No proxy list")
 	rootCmd.PersistentFlags().Int("retry-max", 3, "Maximum retry attempts")
 	rootCmd.PersistentFlags().String("retry-delay", "1s", "Delay between retries")
+	rootCmd.PersistentFlags().Bool("json", false, "Output one final JSON document")
+	rootCmd.PersistentFlags().BoolP("quiet", "q", false, "Suppress progress and summaries")
+	rootCmd.PersistentFlags().Bool("verbose", false, "Show retry and diagnostic details")
 
 	// Bind flags to viper
 	viper.BindPFlag("HTTP_PROXY", rootCmd.PersistentFlags().Lookup("http-proxy"))

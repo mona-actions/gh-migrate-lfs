@@ -20,7 +20,9 @@ var migrateCmd = &cobra.Command{
 		if err := checkGitLFS(cmd); err != nil {
 			return fmt.Errorf("git lfs command not found; install Git LFS from https://git-lfs.com: %w", err)
 		}
-		return migrate.Run(cmd.Context(), cfg)
+		cfg.Output = newRenderer(cmd)
+		runErr := migrate.Run(cmd.Context(), cfg)
+		return finishCommand(cfg.Output, "migrate", runErr)
 	},
 }
 

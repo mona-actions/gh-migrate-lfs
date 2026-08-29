@@ -1,11 +1,15 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/mattn/go-isatty"
+	"github.com/mona-actions/gh-migrate-lfs/internal/output"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -70,10 +74,39 @@ func durationConfig(cmd *cobra.Command, flagName, key string) (time.Duration, er
 	return duration, nil
 }
 
-func showConnectionStatus(hostname string) {
+func newRenderer(cmd *cobra.Command) *output.Renderer {
+	quiet, _ := cmd.Flags().GetBool("quiet")
+	verbose, _ := cmd.Flags().GetBool("verbose")
+	jsonOutput, _ := cmd.Flags().GetBool("json")
+	tty := false
+	if errOut, ok := cmd.ErrOrStderr().(*os.File); ok {
+		tty = isatty.IsTerminal(errOut.Fd()) || isatty.IsCygwinTerminal(errOut.Fd())
+	}
+	if os.Getenv("TERM") == "dumb" {
+		tty = false
+	}
+	if _, forced := os.LookupEnv("GH_FORCE_TTY"); forced {
+		tty = true
+	}
+	return output.New(output.Options{
+		Out:     cmd.OutOrStdout(),
+		ErrOut:  cmd.ErrOrStderr(),
+		TTY:     tty,
+		Quiet:   quiet,
+		Verbose: verbose,
+		JSON:    jsonOutput,
+	})
+}
+
+func finishCommand(renderer *output.Renderer, command string, runErr error) error {
+	renderer.FlushJSON(command, runErr)
+	return errors.Join(runErr, renderer.Err())
+}
+
+func showConnectionStatus(renderer *output.Renderer, hostname string) {
 	hostname = normalizedAPIEndpoint(hostname)
-	fmt.Println(hostnameMessage(hostname))
-	fmt.Println(proxyStatus())
+	renderer.Line("%s", hostnameMessage(hostname))
+	renderer.Line("%s", proxyStatus())
 }
 
 func normalizedAPIEndpoint(hostname string) string {
@@ -90,14 +123,14 @@ func normalizedAPIEndpoint(hostname string) string {
 
 func hostnameMessage(hostname string) string {
 	if hostname != "" {
-		return fmt.Sprintf("\nUsing GitHub Enterprise Server: %s", hostname)
+		return fmt.Sprintf("Using GitHub Enterprise Server: %s", hostname)
 	}
-	return "\nUsing GitHub.com"
+	return "Using GitHub.com"
 }
 
 func proxyStatus() string {
 	if viper.GetString("HTTP_PROXY") != "" || viper.GetString("HTTPS_PROXY") != "" {
-		return "Proxy: configured\n"
+		return "Proxy: configured"
 	}
-	return "Proxy: not configured\n"
+	return "Proxy: not configured"
 }

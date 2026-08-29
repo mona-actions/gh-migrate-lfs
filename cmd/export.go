@@ -23,16 +23,19 @@ var exportCmd = &cobra.Command{
 			return err
 		}
 
-		showConnectionStatus(sourceHostname)
-		if err := export.Run(cmd.Context(), export.Config{
+		renderer := newRenderer(cmd)
+		showConnectionStatus(renderer, sourceHostname)
+		runErr := export.Run(cmd.Context(), export.Config{
 			Organization: sourceOrganization,
 			Token:        sourceToken,
 			Hostname:     sourceHostname,
 			Depth:        intConfig(cmd, "search-depth", "GHMLFS_SEARCH_DEPTH"),
-		}); err != nil {
-			return fmt.Errorf("export LFS repositories: %w", err)
+			Output:       renderer,
+		})
+		if runErr != nil {
+			runErr = fmt.Errorf("export LFS repositories: %w", runErr)
 		}
-		return nil
+		return finishCommand(renderer, "export", runErr)
 	},
 }
 

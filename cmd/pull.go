@@ -28,15 +28,18 @@ var pullCmd = &cobra.Command{
 			return err
 		}
 
-		if err := pull.Run(cmd.Context(), pull.Config{
+		renderer := newRenderer(cmd)
+		runErr := pull.Run(cmd.Context(), pull.Config{
 			InputFile: manifestPath,
 			Token:     sourceToken,
 			WorkDir:   workDir,
 			Workers:   intConfig(cmd, "workers", "GHMLFS_WORKERS"),
-		}); err != nil {
-			return fmt.Errorf("pull LFS repositories: %w", err)
+			Output:    renderer,
+		})
+		if runErr != nil {
+			runErr = fmt.Errorf("pull LFS repositories: %w", runErr)
 		}
-		return nil
+		return finishCommand(renderer, "pull", runErr)
 	},
 }
 

@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/google/go-github/v66/github"
+	"github.com/google/go-github/v90/github"
 )
 
 func TestEnterpriseURLs(t *testing.T) {

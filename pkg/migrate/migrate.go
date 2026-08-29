@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/mona-actions/gh-migrate-lfs/internal/output"
 	exportpkg "github.com/mona-actions/gh-migrate-lfs/pkg/export"
 	"github.com/mona-actions/gh-migrate-lfs/pkg/pull"
 	syncpkg "github.com/mona-actions/gh-migrate-lfs/pkg/sync"
@@ -37,6 +38,7 @@ type Config struct {
 	CheckHashes        bool
 	DryRun             bool
 	FinalCheck         bool
+	Output             *output.Renderer
 }
 
 type phaseRunner struct {
@@ -64,32 +66,40 @@ func run(ctx context.Context, cfg Config, phases phaseRunner) error {
 	}
 
 	manifestPath := cfg.Manifest
+	source := cfg.SourceOrganization
+	if manifestPath != "" {
+		source = manifestPath
+	}
+	cfg.Output.Line("Git LFS migration")
+	cfg.Output.Line("Source: %s", source)
+	cfg.Output.Line("Destination: %s", cfg.TargetOrganization)
 	if manifestPath == "" {
 		manifestPath = filepath.Join(cfg.WorkDir, cfg.SourceOrganization+"_lfs.csv")
-		fmt.Println("\n=== Export LFS repositories ===")
+		cfg.Output.Line("\nExport")
 		if err := phases.export(ctx, exportpkg.Config{
 			Organization: cfg.SourceOrganization,
 			Token:        cfg.SourceToken,
 			Hostname:     cfg.SourceHostname,
 			Depth:        cfg.SearchDepth,
 			OutputFile:   manifestPath,
+			Output:       cfg.Output,
 		}); err != nil {
 			return fmt.Errorf("export phase: %w", err)
 		}
-		fmt.Printf("Manifest: %s\n", manifestPath)
 	}
 
-	fmt.Println("\n=== Pull source LFS objects ===")
+	cfg.Output.Line("\nPull")
 	if err := phases.pull(ctx, pull.Config{
 		InputFile: manifestPath,
 		Token:     cfg.SourceToken,
 		WorkDir:   cfg.WorkDir,
 		Workers:   cfg.Workers,
+		Output:    cfg.Output,
 	}); err != nil {
 		return fmt.Errorf("pull phase: %w", err)
 	}
 
-	fmt.Println("\n=== Sync destination LFS objects ===")
+	cfg.Output.Line("\nSync")
 	if err := phases.sync(ctx, syncpkg.Config{
 		InputFile:      manifestPath,
 		WorkDir:        cfg.WorkDir,
@@ -105,12 +115,13 @@ func run(ctx context.Context, cfg Config, phases phaseRunner) error {
 		DryRun:         cfg.DryRun,
 		FinalCheck:     cfg.FinalCheck,
 		StateRoot:      cfg.StateRoot,
+		Output:         cfg.Output,
 	}); err != nil {
 		return fmt.Errorf("sync phase: %w", err)
 	}
 
-	fmt.Println("\nMigration completed successfully!")
-	return nil
+	cfg.Output.Result("\nMigration complete\n")
+	return cfg.Output.Err()
 }
 
 func validateConfig(cfg Config) error {
