@@ -31,7 +31,8 @@ var syncCmd = &cobra.Command{
 			return fmt.Errorf("invalid retry delay: %w", err)
 		}
 
-		showConnectionStatus(targetHostname)
+		renderer := newRenderer(cmd)
+		showConnectionStatus(renderer, targetHostname)
 		err = syncpkg.Run(cmd.Context(), syncpkg.Config{
 			InputFile:      manifestPath,
 			WorkDir:        workDir,
@@ -47,11 +48,12 @@ var syncCmd = &cobra.Command{
 			DryRun:         boolConfig(cmd, "dry-run", "GHMLFS_DRY_RUN"),
 			FinalCheck:     !boolConfig(cmd, "no-final-check", "GHMLFS_NO_FINAL_CHECK"),
 			StateRoot:      stringConfig(cmd, "state", "GHMLFS_STATE_DIR"),
+			Output:         renderer,
 		})
 		if err != nil {
-			return fmt.Errorf("sync repositories: %w", err)
+			err = fmt.Errorf("sync repositories: %w", err)
 		}
-		return nil
+		return finishCommand(renderer, "sync", err)
 	},
 }
 

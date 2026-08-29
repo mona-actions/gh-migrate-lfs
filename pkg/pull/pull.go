@@ -10,10 +10,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/mona-actions/gh-migrate-lfs/internal/manifest"
+	"github.com/mona-actions/gh-migrate-lfs/internal/output"
 	"github.com/mona-actions/gh-migrate-lfs/internal/worker"
-	"github.com/pterm/pterm"
 )
 
 type Config struct {
@@ -21,9 +23,23 @@ type Config struct {
 	Token     string
 	WorkDir   string
 	Workers   int
+	Output    *output.Renderer
+}
+
+type Summary struct {
+	Complete              bool   `json:"complete"`
+	Repositories          int    `json:"repositories"`
+	RepositoriesSucceeded int    `json:"repositories_succeeded"`
+	RepositoriesFailed    int    `json:"repositories_failed"`
+	Duration              string `json:"duration"`
+	OutputDirectory       string `json:"output_directory"`
 }
 
 func Run(ctx context.Context, cfg Config) error {
+	return run(ctx, cfg, pullRepository)
+}
+
+func run(ctx context.Context, cfg Config, puller func(context.Context, string, string, string, []string) error) error {
 	repositories, err := manifest.Load(cfg.InputFile)
 	if err != nil {
 		return err
@@ -35,21 +51,54 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	close(jobChannel)
 
+	workers := max(cfg.Workers, 1)
+	cfg.Output.Line("Pulling Git LFS objects with %d workers", workers)
 	stats := worker.NewStats()
-	err = worker.Run(ctx, jobChannel, max(cfg.Workers, 1), stats, func(repository manifest.Repository) error {
+	var completed atomic.Int32
+	var active atomic.Int32
+	err = worker.Run(ctx, jobChannel, workers, stats, func(repository manifest.Repository) error {
+		active.Add(1)
+		cfg.Output.Status("Repositories %d/%d complete | %d active", completed.Load(), len(repositories), active.Load())
+		startedAt := time.Now()
 		gitEnv, err := gitAuthEnvironment(repository.CloneURL, cfg.Token)
+		if err == nil {
+			err = puller(ctx, repository.Name, repository.CloneURL, cfg.WorkDir, gitEnv)
+		}
+		active.Add(-1)
+		completed.Add(1)
+		duration := time.Since(startedAt).Round(time.Second)
+		if err != nil {
+			cfg.Output.Line("Failed %s  %v", repository.Name, err)
+		} else {
+			cfg.Output.Line("Complete %s  %v", repository.Name, duration)
+		}
+		cfg.Output.Status("Repositories %d/%d complete | %d active", completed.Load(), len(repositories), active.Load())
 		if err != nil {
 			return fmt.Errorf("%s: %w", repository.Name, err)
 		}
-		return pullRepository(ctx, repository.Name, repository.CloneURL, cfg.WorkDir, gitEnv)
+		return nil
 	})
-	stats.PrintSummary(cfg.WorkDir)
+	cfg.Output.FinishStatus("Repositories %d/%d complete", completed.Load(), len(repositories))
+	workerSummary := stats.Summary()
+	status := "complete"
 	if err != nil {
-		return err
+		status = "incomplete"
 	}
-
-	fmt.Println("\nPull completed successfully!")
-	return nil
+	summary := Summary{
+		Complete:              err == nil,
+		Repositories:          len(repositories),
+		RepositoriesSucceeded: workerSummary.Succeeded,
+		RepositoriesFailed:    workerSummary.Failed,
+		Duration:              workerSummary.Duration.Round(time.Second).String(),
+		OutputDirectory:       cfg.WorkDir,
+	}
+	cfg.Output.Record("pull", summary)
+	cfg.Output.Result("\nPull %s\n\n", status)
+	cfg.Output.Result("Repositories succeeded: %d\n", summary.RepositoriesSucceeded)
+	cfg.Output.Result("Repositories failed:    %d\n", summary.RepositoriesFailed)
+	cfg.Output.Result("Duration:               %s\n", summary.Duration)
+	cfg.Output.Result("Output:                 %s\n", summary.OutputDirectory)
+	return errors.Join(err, cfg.Output.Err())
 }
 
 func pullRepository(ctx context.Context, repoName, cloneURL, workDir string, gitEnv []string) error {
@@ -63,7 +112,6 @@ func pullRepository(ctx context.Context, repoName, cloneURL, workDir string, git
 		return err
 	}
 	if exists {
-		pterm.Info.Printf("Repository exists '%s', proceeding with update\n", repoName)
 		if err := runGit(ctx, repoPath, gitEnv, "remote", "set-url", "origin", cloneURL); err != nil {
 			return fmt.Errorf("set clean origin URL: %w", err)
 		}
@@ -71,7 +119,6 @@ func pullRepository(ctx context.Context, repoName, cloneURL, workDir string, git
 			return fmt.Errorf("update mirror: %w", err)
 		}
 	} else {
-		pterm.Info.Printf("Cloning repository '%s'...\n", repoName)
 		if err := runGit(ctx, workDir, gitEnv, "clone", "--mirror", "--bare", cloneURL, repoName); err != nil {
 			return fmt.Errorf("clone mirror: %w", err)
 		}
@@ -80,7 +127,6 @@ func pullRepository(ctx context.Context, repoName, cloneURL, workDir string, git
 	if err := runGit(ctx, repoPath, gitEnv, "lfs", "fetch", "--all"); err != nil {
 		return fmt.Errorf("fetch LFS objects: %w", err)
 	}
-	pterm.Success.Printf("synchronized: %s\n", repoName)
 	return nil
 }
 

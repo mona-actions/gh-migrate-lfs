@@ -11,7 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/go-github/v66/github"
+	"github.com/google/go-github/v90/github"
+	"github.com/mona-actions/gh-migrate-lfs/internal/output"
 	"github.com/spf13/viper"
 )
 
@@ -29,18 +30,20 @@ func newGitHubClient(token, hostname string) (*github.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = proxyFunc(proxyConfigFromEnvironment())
 	httpClient := &http.Client{Transport: transport, Timeout: 60 * time.Second}
-	client := github.NewClient(httpClient).WithAuthToken(token)
-	if strings.TrimSpace(hostname) == "" {
-		return client, nil
+	options := []github.ClientOptionsFunc{
+		github.WithHTTPClient(httpClient),
+		github.WithAuthToken(token),
 	}
-
-	apiURL, uploadURL, err := enterpriseURLs(hostname)
-	if err != nil {
-		return nil, err
+	if strings.TrimSpace(hostname) != "" {
+		apiURL, uploadURL, err := enterpriseURLs(hostname)
+		if err != nil {
+			return nil, err
+		}
+		options = append(options, github.WithEnterpriseURLs(apiURL, uploadURL))
 	}
-	client, err = client.WithEnterpriseURLs(apiURL, uploadURL)
+	client, err := github.NewClient(options...)
 	if err != nil {
-		return nil, fmt.Errorf("configure enterprise URLs: %w", err)
+		return nil, fmt.Errorf("configure GitHub client: %w", err)
 	}
 	return client, nil
 }
@@ -119,7 +122,7 @@ func proxyConfigFromEnvironment() *proxyConfig {
 	}
 }
 
-func retryOperation(ctx context.Context, operation func() error) error {
+func retryOperation(ctx context.Context, renderer *output.Renderer, operation func() error) error {
 	maxRetries := viper.GetInt("GHMLFS_RETRY_MAX")
 	if maxRetries <= 0 {
 		maxRetries = 3
@@ -142,7 +145,7 @@ func retryOperation(ctx context.Context, operation func() error) error {
 			break
 		}
 		delay := min(retryDelay*time.Duration(1<<(attempt-1)), 16*time.Second)
-		fmt.Printf("Attempt %d failed, retrying in %v: %v\n", attempt, delay, lastErr)
+		renderer.Verbose("Attempt %d failed, retrying in %v: %v", attempt, delay, lastErr)
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -172,7 +175,7 @@ func retryableError(err error) bool {
 	return errors.As(err, &networkError)
 }
 
-func FindLFSAttributes(ctx context.Context, org, repo, token string, depth int, hostname string) (bool, string, error) {
+func FindLFSAttributes(ctx context.Context, org, repo, token string, depth int, hostname string, renderer *output.Renderer) (bool, string, error) {
 	client, err := newGitHubClient(token, hostname)
 	if err != nil {
 		return false, "", fmt.Errorf("initialize GitHub client: %w", err)
@@ -190,7 +193,7 @@ func FindLFSAttributes(ctx context.Context, org, repo, token string, depth int, 
 		var fileContent *github.RepositoryContent
 		var dirContent []*github.RepositoryContent
 		var response *github.Response
-		err := retryOperation(ctx, func() error {
+		err := retryOperation(ctx, renderer, func() error {
 			var requestErr error
 			fileContent, dirContent, response, requestErr = client.Repositories.GetContents(ctx, org, repo, path, nil)
 			return requestErr
@@ -203,14 +206,14 @@ func FindLFSAttributes(ctx context.Context, org, repo, token string, depth int, 
 		}
 
 		if fileContent != nil && fileContent.GetName() == ".gitattributes" {
-			matched, err := gitAttributesUsesLFS(ctx, client, org, repo, fileContent.GetPath())
+			matched, err := gitAttributesUsesLFS(ctx, client, org, repo, fileContent.GetPath(), renderer)
 			return matched, fileContent.GetPath(), err
 		}
 		for _, item := range dirContent {
 			if item.GetType() != "file" || item.GetName() != ".gitattributes" {
 				continue
 			}
-			matched, err := gitAttributesUsesLFS(ctx, client, org, repo, item.GetPath())
+			matched, err := gitAttributesUsesLFS(ctx, client, org, repo, item.GetPath(), renderer)
 			if err != nil || matched {
 				return matched, item.GetPath(), err
 			}
@@ -234,9 +237,9 @@ func FindLFSAttributes(ctx context.Context, org, repo, token string, depth int, 
 	return matched, foundPath, nil
 }
 
-func gitAttributesUsesLFS(ctx context.Context, client *github.Client, org, repo, path string) (bool, error) {
+func gitAttributesUsesLFS(ctx context.Context, client *github.Client, org, repo, path string, renderer *output.Renderer) (bool, error) {
 	var content string
-	err := retryOperation(ctx, func() error {
+	err := retryOperation(ctx, renderer, func() error {
 		reader, _, err := client.Repositories.DownloadContents(ctx, org, repo, path, nil)
 		if err != nil {
 			return err
@@ -255,7 +258,7 @@ func gitAttributesUsesLFS(ctx context.Context, client *github.Client, org, repo,
 	return strings.Contains(content, "filter=lfs"), nil
 }
 
-func ListRepositories(ctx context.Context, org, token, hostname string) ([]string, error) {
+func ListRepositories(ctx context.Context, org, token, hostname string, renderer *output.Renderer) ([]string, error) {
 	if org == "" {
 		return nil, errors.New("organization name is required")
 	}
@@ -269,7 +272,7 @@ func ListRepositories(ctx context.Context, org, token, hostname string) ([]strin
 	for {
 		var page []*github.Repository
 		var response *github.Response
-		err := retryOperation(ctx, func() error {
+		err := retryOperation(ctx, renderer, func() error {
 			var requestErr error
 			page, response, requestErr = client.Repositories.ListByOrg(ctx, org, opts)
 			return requestErr

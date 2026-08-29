@@ -1,16 +1,70 @@
 package migrate
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/mona-actions/gh-migrate-lfs/internal/output"
 	exportpkg "github.com/mona-actions/gh-migrate-lfs/pkg/export"
 	"github.com/mona-actions/gh-migrate-lfs/pkg/pull"
 	syncpkg "github.com/mona-actions/gh-migrate-lfs/pkg/sync"
 )
+
+func TestRunAggregatesPhaseResultsForJSON(t *testing.T) {
+	t.Parallel()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	renderer := output.New(output.Options{Out: &stdout, ErrOut: &stderr, JSON: true})
+	cfg := validConfig(filepath.Join(t.TempDir(), "work"))
+	cfg.Output = renderer
+	phases := phaseRunner{
+		export: func(_ context.Context, cfg exportpkg.Config) error {
+			cfg.Output.Record("export", map[string]bool{"complete": true})
+			return nil
+		},
+		pull: func(_ context.Context, cfg pull.Config) error {
+			cfg.Output.Record("pull", map[string]bool{"complete": true})
+			return nil
+		},
+		sync: func(_ context.Context, cfg syncpkg.Config) error {
+			cfg.Output.Record("sync", map[string]bool{"complete": true})
+			return nil
+		},
+	}
+
+	runErr := run(context.Background(), cfg, phases)
+	if runErr != nil {
+		t.Fatalf("run() error = %v", runErr)
+	}
+	renderer.FlushJSON("migrate", runErr)
+
+	var document struct {
+		Command  string                     `json:"command"`
+		Complete bool                       `json:"complete"`
+		Phases   map[string]json.RawMessage `json:"phases"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &document); err != nil {
+		t.Fatalf("stdout is not JSON: %v: %q", err, stdout.String())
+	}
+	if document.Command != "migrate" || !document.Complete || len(document.Phases) != 3 {
+		t.Fatalf("document = %#v", document)
+	}
+	for _, phase := range []string{"export", "pull", "sync"} {
+		if _, ok := document.Phases[phase]; !ok {
+			t.Fatalf("phase %q missing from %#v", phase, document.Phases)
+		}
+	}
+	if strings.Contains(stdout.String(), "Migration complete") {
+		t.Fatalf("human output leaked to stdout: %q", stdout.String())
+	}
+}
 
 func TestRunExecutesAllPhasesInOrder(t *testing.T) {
 	t.Parallel()

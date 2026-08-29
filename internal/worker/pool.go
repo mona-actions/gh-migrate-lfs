@@ -15,18 +15,22 @@ type Stats struct {
 	startedAt time.Time
 }
 
+type Summary struct {
+	Succeeded int
+	Failed    int
+	Duration  time.Duration
+}
+
 func NewStats() *Stats {
 	return &Stats{startedAt: time.Now()}
 }
 
-func (stats *Stats) PrintSummary(workDir string) {
-	fmt.Printf("\n📊 Summary:\n")
-	fmt.Printf("✅ Successfully processed: %d repositories\n", stats.succeeded.Load())
-	fmt.Printf("❌ Failed: %d repositories\n", stats.failed.Load())
-	if workDir != "" {
-		fmt.Printf("📁 Output directory: %s\n", workDir)
+func (stats *Stats) Summary() Summary {
+	return Summary{
+		Succeeded: int(stats.succeeded.Load()),
+		Failed:    int(stats.failed.Load()),
+		Duration:  time.Since(stats.startedAt),
 	}
-	fmt.Printf("🕐 Total time: %v\n", time.Since(stats.startedAt).Round(time.Second))
 }
 
 func Run[T any](ctx context.Context, jobs <-chan T, maxWorkers int, stats *Stats, process func(T) error) error {
@@ -36,7 +40,6 @@ func Run[T any](ctx context.Context, jobs <-chan T, maxWorkers int, stats *Stats
 	var waitGroup sync.WaitGroup
 	var errorsMu sync.Mutex
 	var workerErrors []error
-	fmt.Printf("Processing repositories with %d worker(s)...\n", maxWorkers)
 
 	for range maxWorkers {
 		waitGroup.Add(1)
@@ -73,12 +76,7 @@ func Run[T any](ctx context.Context, jobs <-chan T, maxWorkers int, stats *Stats
 		workerErrors = append(workerErrors, err)
 	}
 	if len(workerErrors) == 0 {
-		fmt.Println("Repository processing complete.")
 		return nil
-	}
-
-	for _, err := range workerErrors {
-		fmt.Printf("Error processing: %v\n", err)
 	}
 	return fmt.Errorf("failed to process %d repositories: %w", stats.failed.Load(), errors.Join(workerErrors...))
 }

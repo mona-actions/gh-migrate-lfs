@@ -121,6 +121,32 @@ gh migrate-lfs sync \
 
 Use `gh migrate-lfs <command> --help` for the complete flag reference.
 
+## Terminal Output
+
+Interactive commands keep one progress line at the bottom of the terminal and update it in place. Repository findings and completed repository results are printed permanently, so every repository remains visible in the transcript.
+
+When output is redirected or the terminal is not interactive, progress becomes stable plain-text lines with no cursor control sequences. Long-running status updates are limited to one line every 30 seconds, while repository findings, completions, and failures are always printed.
+
+Output controls are available on every command:
+
+- `--json`: write one final structured document to standard output; progress and diagnostics remain on standard error.
+- `--quiet`, `-q`: suppress progress and human-readable summaries; errors are still reported. When combined with `--json`, the JSON document is still written.
+- `--verbose`: include retry and diagnostic details.
+
+`GH_FORCE_TTY` forces interactive progress rendering. `TERM=dumb` disables it unless `GH_FORCE_TTY` is set.
+
+For example, capture a machine-readable migration result without mixing progress into the document:
+
+```bash
+gh migrate-lfs migrate \
+  --file source-org_lfs.csv \
+  --source-token "$SOURCE_TOKEN" \
+  --target-organization target-org \
+  --target-token "$TARGET_TOKEN" \
+  --work-dir ./lfs-migration \
+  --json > migration-result.json
+```
+
 ## Performance Controls
 
 - `--workers`: repositories processed concurrently.
