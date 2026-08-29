@@ -3,11 +3,21 @@ package output
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
+
+type failingWriter struct {
+	err error
+}
+
+func (writer failingWriter) Write([]byte) (int, error) {
+	return 0, writer.err
+}
 
 func TestRendererSerializesLinesAroundTTYStatus(t *testing.T) {
 	var stderr bytes.Buffer
@@ -97,5 +107,79 @@ func TestRendererJSONKeepsStdoutMachineReadable(t *testing.T) {
 	}
 	if got := stderr.String(); got != "Working\n" {
 		t.Fatalf("stderr = %q", got)
+	}
+}
+
+func TestRendererThrottlesPlainStatus(t *testing.T) {
+	var stderr bytes.Buffer
+	renderer := New(Options{ErrOut: &stderr})
+
+	renderer.Status("Searching 1/3")
+	renderer.Status("Searching 2/3")
+	if got, want := stderr.String(), "Searching 1/3\n"; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+
+	renderer.lastStatusAt = time.Now().Add(-plainStatusInterval)
+	renderer.Status("Searching 3/3")
+	if got, want := stderr.String(), "Searching 1/3\nSearching 3/3\n"; got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+}
+
+func TestRendererVerboseRedrawsTTYStatus(t *testing.T) {
+	var stderr bytes.Buffer
+	renderer := New(Options{ErrOut: &stderr, TTY: true, Verbose: true})
+
+	renderer.Status("Repositories 1/2")
+	renderer.Verbose("Retrying request")
+	renderer.ClearStatus()
+
+	want := clearLine + "Repositories 1/2" + clearLine + "Retrying request\n" + "Repositories 1/2" + clearLine
+	if got := stderr.String(); got != want {
+		t.Fatalf("stderr = %q, want %q", got, want)
+	}
+	if renderer.status != "" {
+		t.Fatalf("status = %q", renderer.status)
+	}
+}
+
+func TestRendererVerboseDisabledProducesNoOutput(t *testing.T) {
+	var stderr bytes.Buffer
+	renderer := New(Options{ErrOut: &stderr})
+	renderer.Verbose("hidden")
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q", stderr.String())
+	}
+}
+
+func TestRendererJSONIncludesRunFailure(t *testing.T) {
+	var stdout bytes.Buffer
+	renderer := New(Options{Out: &stdout, JSON: true})
+	wantErr := errors.New("upload denied")
+	renderer.FlushJSON("sync", wantErr)
+
+	var document struct {
+		Complete bool   `json:"complete"`
+		Error    string `json:"error"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.Complete || document.Error != wantErr.Error() {
+		t.Fatalf("document = %#v", document)
+	}
+}
+
+func TestRendererReportsWriterFailures(t *testing.T) {
+	wantErr := errors.New("writer failed")
+	renderer := New(Options{Out: failingWriter{err: wantErr}, ErrOut: failingWriter{err: wantErr}, JSON: true})
+
+	renderer.Status("working")
+	renderer.Error("failed")
+	renderer.FlushJSON("sync", nil)
+
+	if err := renderer.Err(); !errors.Is(err, wantErr) {
+		t.Fatalf("Renderer.Err() = %v", err)
 	}
 }
