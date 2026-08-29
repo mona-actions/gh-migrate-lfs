@@ -19,12 +19,13 @@ jobs:
       - name: Check configuration
         shell: bash
         env:
-          APP_CLIENT_ID: ${{ vars.LIVE_LFS_APP_CLIENT_ID }}
+          SOURCE_APP_CLIENT_ID: ${{ vars.LIVE_LFS_SOURCE_APP_CLIENT_ID }}
+          TARGET_APP_CLIENT_ID: ${{ vars.LIVE_LFS_TARGET_APP_CLIENT_ID }}
           SOURCE_ORGANIZATION: ${{ vars.LIVE_LFS_SOURCE_ORGANIZATION }}
-          SOURCE_REPOSITORY: ${{ vars.LIVE_LFS_SOURCE_REPOSITORY }}
+          SOURCE_REPOSITORIES: ${{ vars.LIVE_LFS_SOURCE_REPOSITORIES }}
           TARGET_ORGANIZATION: ${{ vars.LIVE_LFS_TARGET_ORGANIZATION }}
         run: |
-          for variable in APP_CLIENT_ID SOURCE_ORGANIZATION SOURCE_REPOSITORY TARGET_ORGANIZATION; do
+          for variable in SOURCE_APP_CLIENT_ID TARGET_APP_CLIENT_ID SOURCE_ORGANIZATION SOURCE_REPOSITORIES TARGET_ORGANIZATION; do
             if [[ -z "${!variable}" ]]; then
               printf 'Required live-lfs variable is not set: %s\n' "$variable" >&2
               exit 1
@@ -45,18 +46,18 @@ jobs:
         id: source-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          client-id: ${{ vars.LIVE_LFS_APP_CLIENT_ID }}
-          private-key: ${{ secrets.LIVE_LFS_APP_PRIVATE_KEY }}
+          client-id: ${{ vars.LIVE_LFS_SOURCE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.LIVE_LFS_SOURCE_APP_PRIVATE_KEY }}
           owner: ${{ vars.LIVE_LFS_SOURCE_ORGANIZATION }}
-          repositories: ${{ vars.LIVE_LFS_SOURCE_REPOSITORY }}
+          repositories: ${{ vars.LIVE_LFS_SOURCE_REPOSITORIES }}
           permission-contents: read
 
       - name: Create target installation token
         id: target-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          client-id: ${{ vars.LIVE_LFS_APP_CLIENT_ID }}
-          private-key: ${{ secrets.LIVE_LFS_APP_PRIVATE_KEY }}
+          client-id: ${{ vars.LIVE_LFS_TARGET_APP_CLIENT_ID }}
+          private-key: ${{ secrets.LIVE_LFS_TARGET_APP_PRIVATE_KEY }}
           owner: ${{ vars.LIVE_LFS_TARGET_ORGANIZATION }}
           permission-administration: write
           permission-contents: write
@@ -65,10 +66,13 @@ jobs:
         shell: bash
         env:
           LIVE_LFS_SOURCE_ORGANIZATION: ${{ vars.LIVE_LFS_SOURCE_ORGANIZATION }}
-          LIVE_LFS_SOURCE_REPOSITORY: ${{ vars.LIVE_LFS_SOURCE_REPOSITORY }}
+          LIVE_LFS_SOURCE_REPOSITORIES: ${{ vars.LIVE_LFS_SOURCE_REPOSITORIES }}
           LIVE_LFS_SOURCE_TOKEN: ${{ steps.source-token.outputs.token }}
           LIVE_LFS_TARGET_ORGANIZATION: ${{ vars.LIVE_LFS_TARGET_ORGANIZATION }}
           LIVE_LFS_TARGET_TOKEN: ${{ steps.target-token.outputs.token }}
+          LIVE_LFS_WORKERS: 3
+          LIVE_LFS_UPLOAD_PARALLEL: 4
+          LIVE_LFS_BATCH_SIZE: 5
         run: bash scripts/live-transfer-test.sh
 
       - name: Clean up target fallback
@@ -78,24 +82,26 @@ jobs:
           TARGET_ORGANIZATION: ${{ vars.LIVE_LFS_TARGET_ORGANIZATION }}
           TARGET_TOKEN: ${{ steps.target-token.outputs.token }}
         run: |
-          target_file=live-transfer-artifacts/target-repository.txt
+          target_file=live-transfer-artifacts/target-repositories.txt
           if [[ ! -f "$target_file" || -z "$TARGET_TOKEN" ]]; then
             exit 0
           fi
-          target_repository=$(<"$target_file")
-          if [[ ! "$target_repository" =~ ^ghmlfs-live-[a-z0-9.-]+$ ]]; then
-            printf 'Refusing to delete unexpected repository name: %s\n' "$target_repository" >&2
-            exit 1
-          fi
-          if error=$(GH_TOKEN="$TARGET_TOKEN" gh api \
-            --silent \
-            --method DELETE \
-            "repos/$TARGET_ORGANIZATION/$target_repository" 2>&1); then
-            printf 'deleted by workflow fallback\n' >live-transfer-artifacts/cleanup-status.txt
-          elif [[ "$error" != *"HTTP 404"* ]]; then
-            printf '%s\n' "$error" >&2
-            exit 1
-          fi
+          while IFS= read -r target_repository; do
+            if [[ ! "$target_repository" =~ ^ghmlfs-live-[a-z0-9.-]+$ ]]; then
+              printf 'Refusing to delete unexpected repository name: %s\n' "$target_repository" >&2
+              exit 1
+            fi
+            if error=$(GH_TOKEN="$TARGET_TOKEN" gh api \
+              --silent \
+              --method DELETE \
+              "repos/$TARGET_ORGANIZATION/$target_repository" 2>&1); then
+              printf '%s\tdeleted by workflow fallback\n' "$target_repository" \
+                >>live-transfer-artifacts/cleanup-status.txt
+            elif [[ "$error" != *"HTTP 404"* ]]; then
+              printf '%s\n' "$error" >&2
+              exit 1
+            fi
+          done <"$target_file"
 
       - name: Upload live-transfer reports
         if: always()
